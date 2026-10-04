@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: customer-portal
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/portal
+    username: portal
+    password: ${PORTAL_DB_PASSWORD}
+  h2:
+    console:
+      enabled: true          # codit-expect: CWE-16 H2 web console enabled (remote SQL / code execution surface)
+      path: /h2-console
+
+server:
+  port: 8080
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        secure: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"         # codit-expect: CWE-16 every actuator endpoint (env, heapdump, configprops) exposed over HTTP
+  endpoint:
+    health:
+      show-details: when-authorized

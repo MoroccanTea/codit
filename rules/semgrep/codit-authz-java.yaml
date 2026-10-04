@@ -1,0 +1,406 @@
+# codit bundled semgrep rules - access control (OWASP A01) for Java / Spring.
+# Keep this file pure ASCII: semgrep (pysemgrep) reads local rule files with the
+# locale code page on Windows (cp1252) and aborts with exit 2 on undecodable bytes.
+# Tests: rules/semgrep-tests/codit-authz-java.java
+#   semgrep --test --config rules/semgrep rules/semgrep-tests
+rules:
+  # ------------------------------------------------------------------------------------------
+  - id: codit.java.spring.missing-authz-in-guarded-controller
+    languages: [java]
+    severity: WARNING
+    message: >-
+      Handler $M() in controller $C has no @PreAuthorize/@PostAuthorize/@Secured/@RolesAllowed/@PermitAll
+      although sibling handlers of the same controller are guarded at method level, and the class itself
+      carries no guard. It is probably reachable by any authenticated (or even anonymous) caller.
+      Remediation: add the method-level guard matching its siblings (e.g. @PreAuthorize("hasRole('ADMIN')")),
+      or annotate it @PermitAll when it is intentionally public so the intent is explicit.
+    metadata:
+      cwe: ["CWE-862: Missing Authorization"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [spring, spring-security]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        - https://cwe.mitre.org/data/definitions/862.html
+        - https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              class $C {
+                ...
+                @PreAuthorize(...)
+                $R2 $M2(...) { ... }
+                ...
+              }
+          - pattern-inside: |
+              class $C {
+                ...
+                @Secured(...)
+                $R2 $M2(...) { ... }
+                ...
+              }
+          - pattern-inside: |
+              class $C {
+                ...
+                @RolesAllowed(...)
+                $R2 $M2(...) { ... }
+                ...
+              }
+          - pattern-inside: |
+              interface $C {
+                ...
+                @PreAuthorize(...)
+                $R2 $M2(...);
+                ...
+              }
+          - pattern-inside: |
+              interface $C {
+                ...
+                @Secured(...)
+                $R2 $M2(...);
+                ...
+              }
+          - pattern-inside: |
+              interface $C {
+                ...
+                @RolesAllowed(...)
+                $R2 $M2(...);
+                ...
+              }
+      - pattern-either:
+          - pattern: |
+              @$MAP(...)
+              $R $M(...) { ... }
+          # handler declared on a Spring "API interface" implemented by the controller
+          - pattern: |
+              @$MAP(...)
+              $R $M(...);
+      - metavariable-regex:
+          metavariable: $MAP
+          regex: ^(Get|Post|Put|Delete|Patch|Request)Mapping$
+      - pattern-not: |
+          @PreAuthorize(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @PreAuthorize(...)
+          $R $M(...);
+      - pattern-not: |
+          @PostAuthorize(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @PostAuthorize(...)
+          $R $M(...);
+      - pattern-not: |
+          @Secured(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @Secured(...)
+          $R $M(...);
+      - pattern-not: |
+          @RolesAllowed(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @RolesAllowed(...)
+          $R $M(...);
+      - pattern-not: |
+          @PermitAll(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @PermitAll(...)
+          $R $M(...);
+      - pattern-not: |
+          @DenyAll(...)
+          $R $M(...) { ... }
+      - pattern-not: |
+          @DenyAll(...)
+          $R $M(...);
+      - pattern-not-inside: |
+          @PreAuthorize(...)
+          class $K { ... }
+      - pattern-not-inside: |
+          @PreAuthorize(...)
+          interface $K { ... }
+      - pattern-not-inside: |
+          @Secured(...)
+          class $K { ... }
+      - pattern-not-inside: |
+          @Secured(...)
+          interface $K { ... }
+      - pattern-not-inside: |
+          @RolesAllowed(...)
+          class $K { ... }
+      - pattern-not-inside: |
+          @RolesAllowed(...)
+          interface $K { ... }
+      - pattern-not-inside: |
+          @PermitAll(...)
+          class $K { ... }
+      - pattern-not-inside: |
+          @PermitAll(...)
+          interface $K { ... }
+      - pattern-not-inside: |
+          @DenyAll(...)
+          class $K { ... }
+      - pattern-not-inside: |
+          @DenyAll(...)
+          interface $K { ... }
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.java.spring.write-endpoint-guarded-by-read-permission
+    languages: [java]
+    severity: WARNING
+    message: >-
+      State-changing handler $M() is guarded by $EXPR, which only names a read/view/list permission.
+      Any principal allowed to read can therefore modify or delete data (privilege escalation).
+      Remediation: require the matching write/update/delete authority for this handler
+      (e.g. hasAuthority('user:write')).
+    metadata:
+      cwe: ["CWE-863: Incorrect Authorization"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [spring, spring-security]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        - https://cwe.mitre.org/data/definitions/863.html
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      @$GUARD($EXPR)
+                      @$MAP(...)
+                      $R $M(...) { ... }
+                  - pattern: |
+                      @$GUARD($EXPR)
+                      @$MAP(...)
+                      $R $M(...);
+              - metavariable-regex:
+                  metavariable: $MAP
+                  regex: ^(Put|Post|Delete|Patch)Mapping$
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      @$GUARD($EXPR)
+                      @RequestMapping(..., method = $VERB, ...)
+                      $R $M(...) { ... }
+                  - pattern: |
+                      @$GUARD($EXPR)
+                      @RequestMapping(..., method = $VERB, ...)
+                      $R $M(...);
+              - metavariable-regex:
+                  metavariable: $VERB
+                  regex: .*(POST|PUT|DELETE|PATCH)
+      - metavariable-regex:
+          metavariable: $GUARD
+          regex: ^(PreAuthorize|Secured|RolesAllowed)$
+      # names a read-ish permission (the expression may be a literal or a concatenation of constants) ...
+      - metavariable-regex:
+          metavariable: $EXPR
+          regex: (?i).*?(^|[^a-z])(read|reader|readonly|get|view|viewer|list|search|browse|show)($|[^a-z])
+      # ... and nothing that also grants write/admin
+      - metavariable-regex:
+          metavariable: $EXPR
+          regex: ^(?!.*(?i:admin|superuser|(^|[^a-z])(write|writer|update|edit|editor|delete|remove|create|manage|manager|modify|put|post|patch|grant|full|all|owner|root)($|[^a-z])))
+      # POST/PUT used as a read (search/export/preview, or a getter mapped to PUT) is not a privilege issue
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(?!(?i:search|find|list|query|get|fetch|export|count|check|validate|preview|lookup|filter|read|view|download|report))
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.java.spring.idor-findbyid-without-ownership-check
+    languages: [java]
+    severity: WARNING
+    message: >-
+      Handler $M() loads an object by the client-supplied path id '$ID' ($REPO.$FIND) without any
+      reference to the current principal (no Principal/Authentication/@AuthenticationPrincipal parameter,
+      no SecurityContextHolder lookup, no @PostAuthorize/hasPermission guard). Any caller can read or
+      modify another user's record by changing the id (IDOR).
+      Remediation: scope the query to the owner (findByIdAndOwner(id, principal.getName())), compare the
+      owner with the authenticated user before returning/mutating, or use @PostAuthorize /
+      hasPermission(#id, ...).
+    metadata:
+      cwe: ["CWE-639: Authorization Bypass Through User-Controlled Key"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [spring, spring-data]
+      confidence: LOW
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/639.html
+    patterns:
+      - pattern-inside: |
+          @$MAP(...)
+          $R $M(..., @PathVariable(...) $T $ID, ...) { ... }
+      - metavariable-regex:
+          metavariable: $MAP
+          regex: ^(Get|Post|Put|Delete|Patch|Request)Mapping$
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      class $C {
+                        ...
+                        private $TY $REPO;
+                        ...
+                      }
+                  - pattern-inside: |
+                      class $C {
+                        ...
+                        final $TY $REPO;
+                        ...
+                      }
+                  - pattern-inside: |
+                      class $C {
+                        ...
+                        protected $TY $REPO;
+                        ...
+                      }
+              - metavariable-regex:
+                  metavariable: $TY
+                  regex: .*(Repository|Repo|Dao|DAO)(<.*>)?$
+              - pattern-either:
+                  - pattern: $REPO.$FIND($ID)
+                  - pattern: this.$REPO.$FIND($ID)
+          - patterns:
+              - pattern-either:
+                  - pattern: $REPO.$FIND($ID)
+                  - pattern: this.$REPO.$FIND($ID)
+              - metavariable-regex:
+                  metavariable: $REPO
+                  regex: (?i).*(repo|repository|dao)$
+      - metavariable-regex:
+          metavariable: $FIND
+          regex: ^(findById|getById|getReferenceById|getOne|findOne|deleteById|findByUuid|getByUuid)$
+      # the current principal is consulted somewhere in the handler
+      - pattern-not-inside: |
+          $R $M(..., Principal $P, ...) { ... }
+      - pattern-not-inside: |
+          $R $M(..., Authentication $P, ...) { ... }
+      - pattern-not-inside: |
+          $R $M(..., @AuthenticationPrincipal(...) $PT $P, ...) { ... }
+      - pattern-not-inside: |
+          $R $M(..., @CurrentUser(...) $PT $P, ...) { ... }
+      - pattern-not-inside: |
+          $R $M(..., @CurrentSecurityContext(...) $PT $P, ...) { ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... SecurityContextHolder.$F(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getCurrentUser(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getCurrentUserId(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.currentUser(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getAuthenticatedUser(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getLoggedInUser(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getUserPrincipal(...) ...>; ... }
+      - pattern-not-inside: |
+          $R $M(...) { ... <... $S.getRemoteUser(...) ...>; ... }
+      # object-level guards and admin-only handlers/controllers
+      - pattern-not-inside: |
+          @PostAuthorize(...)
+          $R $M(...) { ... }
+      - pattern-not-inside: |
+          @PreAuthorize("=~/.*(hasPermission|#|principal|authentication|[Aa][Dd][Mm][Ii][Nn]).*/")
+          $R $M(...) { ... }
+      - pattern-not-inside: |
+          @Secured("=~/.*[Aa][Dd][Mm][Ii][Nn].*/")
+          $R $M(...) { ... }
+      - pattern-not-inside: |
+          @RolesAllowed("=~/.*[Aa][Dd][Mm][Ii][Nn].*/")
+          $R $M(...) { ... }
+      - pattern-not-inside: |
+          @PreAuthorize("=~/.*[Aa][Dd][Mm][Ii][Nn].*/")
+          class $K { ... }
+      - pattern-not-inside: |
+          @Secured("=~/.*[Aa][Dd][Mm][Ii][Nn].*/")
+          class $K { ... }
+      - pattern-not-inside: |
+          @RolesAllowed("=~/.*[Aa][Dd][Mm][Ii][Nn].*/")
+          class $K { ... }
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.java.spring.permitall-on-all-paths
+    languages: [java]
+    severity: ERROR
+    message: >-
+      Spring Security rule opens a catch-all path to anonymous callers (anyRequest()/catch-all matcher + permitAll()). Every endpoint
+      under it is reachable without authentication unless each handler re-checks access itself.
+      With @EnableMethodSecurity only handlers that carry their own guard stay protected.
+      Remediation: end the chain with anyRequest().authenticated() (or denyAll()) and permitAll() only an
+      explicit allow-list of public paths (login, health, static assets).
+    metadata:
+      cwe: ["CWE-862: Missing Authorization"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [vuln]
+      technology: [spring, spring-security]
+      confidence: MEDIUM
+      likelihood: HIGH
+      impact: HIGH
+      references:
+        - https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html
+        - https://cwe.mitre.org/data/definitions/862.html
+    patterns:
+      - pattern-either:
+          # also reported under @EnableMethodSecurity: every handler without its own guard (and every
+          # guard that does not itself require authentication) becomes anonymous
+          - pattern: $X.anyRequest().permitAll()
+          - patterns:
+              - pattern-either:
+                  - pattern: $X.$MATCH(..., "$P", ...).permitAll()
+                  - pattern: $X.$MATCH(..., "$P", ...).anonymous()
+              - metavariable-regex:
+                  metavariable: $MATCH
+                  regex: ^(requestMatchers|antMatchers|mvcMatchers|regexMatchers|pathMatchers)$
+              - metavariable-regex:
+                  metavariable: $P
+                  regex: ^(/?\*\*|/\*|/|\.\*|/(api|rest|admin|internal|private|secure|management)(/v\d+)?/\*\*?)$
+              # report the matcher line, not the start of a multi-line DSL chain
+              - focus-metavariable: $P
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.java.spring.web-ignoring-all-paths
+    languages: [java]
+    severity: ERROR
+    message: >-
+      WebSecurity.ignoring() is applied to a catch-all path ($W.ignoring() ...). Ignored requests bypass
+      the whole Spring Security filter chain: no authentication, no authorization, no CSRF, no security
+      headers. Remediation: only ignore static resources (e.g. PathRequest.toStaticResources()), and use
+      authorizeHttpRequests(...permitAll()) for public endpoints instead of ignoring().
+    metadata:
+      cwe: ["CWE-862: Missing Authorization"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [vuln]
+      technology: [spring, spring-security]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      references:
+        - https://docs.spring.io/spring-security/reference/servlet/configuration/java.html
+        - https://cwe.mitre.org/data/definitions/862.html
+    pattern-either:
+      - pattern: $W.ignoring().anyRequest()
+      - patterns:
+          - pattern: $W.ignoring().$MATCH(..., "$P", ...)
+          - metavariable-regex:
+              metavariable: $MATCH
+              regex: ^(requestMatchers|antMatchers|mvcMatchers|regexMatchers)$
+          - metavariable-regex:
+              metavariable: $P
+              regex: ^(/?\*\*|/\*|/|\.\*|/(api|rest|admin|internal|private|secure|management)(/v\d+)?/\*\*?)$

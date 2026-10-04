@@ -1,0 +1,244 @@
+# codit bundled semgrep rules - access control (OWASP A01) for JavaScript / TypeScript
+# (Express, Koa-style handlers, NestJS). Keep this file pure ASCII (see codit-authz-java.yaml).
+# Tests: rules/semgrep-tests/codit-authz-js.js, rules/semgrep-tests/codit-authz-js.ts
+rules:
+  # ------------------------------------------------------------------------------------------
+  - id: codit.js.express.idor-find-by-request-id-without-user
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Route handler loads/updates/deletes a record with $MODEL.$FIND() keyed by the client-supplied
+      req.params.$ID, and the handler never references the authenticated user (req.user, res.locals.user,
+      session user...). Any caller can access or modify another user's object by changing the id (IDOR).
+      Remediation: scope the query to the owner (e.g. findOne({ _id: req.params.id, owner: req.user.id }))
+      or compare the owner with req.user before returning or mutating the record.
+    metadata:
+      cwe: ["CWE-639: Authorization Bypass Through User-Controlled Key"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [express, mongoose, sequelize, prisma, typeorm]
+      confidence: LOW
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/639.html
+    # admin routers are usually mounted behind an admin guard elsewhere (app.use('/admin', requireAdmin, ...))
+    paths:
+      exclude:
+        - "*admin*"
+        - "*Admin*"
+        - "*.test.*"
+        - "*.spec.*"
+    options:
+      symbolic_propagation: true
+    patterns:
+      - pattern-inside: $APP.$VERB($PATH, $...MW, $HANDLER)
+      - metavariable-regex:
+          metavariable: $VERB
+          regex: ^(get|post|put|patch|delete|del|all)$
+      - metavariable-pattern:
+          metavariable: $HANDLER
+          pattern-either:
+            - pattern: function ($REQ, $RES, ...) { ... }
+            - pattern: ($REQ, $RES, ...) => { ... }
+            - pattern: ($REQ, $RES, ...) => $EXPR
+      # no admin / role / permission middleware on the route itself
+      - metavariable-regex:
+          metavariable: $...MW
+          regex: ^(?!.*(?i:admin|role|permission|authoriz|can\(|ability|policy|staff|owner|acl|scope))
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: ^(?!.*(?i:admin))
+      # the handler never looks at the authenticated principal
+      - metavariable-regex:
+          metavariable: $HANDLER
+          regex: ^(?![\s\S]*(\.user\b|\.userId\b|\.user_id\b|\.auth\b|\.account\b|currentUser|res\.locals\.|session\.uid|\bauthorize\(|\.can\(|ability|[Oo]wner[A-Z(]|isOwner|assertOwner|checkOwner))
+      - pattern-either:
+          - pattern: $MODEL.$FIND(<... $REQ.params.$ID ...>, ...)
+          - pattern: $MODEL.$FIND(<... $REQ.params[$ID] ...>, ...)
+      - metavariable-regex:
+          metavariable: $FIND
+          regex: ^(findById|findByIdAndUpdate|findByIdAndDelete|findByIdAndRemove|findByPk|findOne|findOneAndUpdate|findOneAndDelete|findOneAndRemove|findOneBy|findOneByOrFail|findOneOrFail|findUnique|findUniqueOrThrow|findFirst|findFirstOrThrow|updateOne|deleteOne|destroy|update|delete)$
+      # obviously public catalogue-like data
+      - metavariable-regex:
+          metavariable: $MODEL
+          regex: ^(?!.*(?i:product|catalog|categor|article|blog|post|page|faq|tag|countr|currenc|news|plan|price|course|lesson|event|public|static|lookup|translation|i18n))
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.js.authz-decision-on-client-controlled-input
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      An authorization decision uses '$K' read from the request ($LOC). Request bodies, query strings,
+      headers and unsigned cookies are fully attacker-controlled, so anyone can claim an admin role or
+      privilege. Remediation: derive roles/privileges only from the verified server-side identity
+      (req.user populated by the auth middleware, a signed/verified JWT, or the session store).
+    metadata:
+      cwe: ["CWE-807: Reliance on Untrusted Inputs in a Security Decision"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [vuln]
+      technology: [express, nestjs, koa]
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      references:
+        - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        - https://cwe.mitre.org/data/definitions/807.html
+    patterns:
+      - pattern-either:
+          - pattern: $REQ.$LOC.$K === $V
+          - pattern: $REQ.$LOC.$K == $V
+          - pattern: $REQ.$LOC.$K !== $V
+          - pattern: $REQ.$LOC.$K != $V
+          - pattern: $REQ.$LOC[$K] === $V
+          - pattern: $REQ.$LOC[$K] == $V
+          - pattern: $REQ.$LOC[$K] !== $V
+          - pattern: $REQ.$LOC[$K] != $V
+          - pattern: $V.includes($REQ.$LOC.$K)
+          - pattern: $V.includes($REQ.$LOC[$K])
+          - pattern: if ($REQ.$LOC.$K) $BODY
+          - pattern: if (!$REQ.$LOC.$K) $BODY
+          - pattern: if ($REQ.$LOC[$K]) $BODY
+          - pattern: if (!$REQ.$LOC[$K]) $BODY
+          - pattern: "$REQ.$LOC.$K ? $A : $B"
+          - patterns:
+              - pattern-either:
+                  - pattern: $REQ.$GET($K) === $V
+                  - pattern: $REQ.$GET($K) == $V
+                  - pattern: $REQ.$GET($K) !== $V
+                  - pattern: $REQ.$GET($K) != $V
+                  - pattern: if ($REQ.$GET($K)) $BODY
+              - metavariable-regex:
+                  metavariable: $GET
+                  regex: ^(header|get)$
+              - metavariable-regex:
+                  metavariable: $K
+                  regex: (?i)^['"`]x-
+      - metavariable-regex:
+          metavariable: $REQ
+          regex: (?i)(^|\.)(req|request)$
+      - metavariable-regex:
+          metavariable: $LOC
+          regex: ^(body|query|cookies|headers|params)$
+      - metavariable-regex:
+          metavariable: $K
+          regex: (?i)^['"`]?(x-[\w-]*)?(role|roles|is_?admin|is-admin|admin|user_?type|user-type|account_?type|permissions?|privileges?|access_?level|is_?staff|is_?superuser|superuser|group|groups)['"`]?$
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.ts.nestjs.missing-useguards-in-guarded-controller
+    languages: [typescript]
+    severity: WARNING
+    message: >-
+      Handler $M() of $C has no @UseGuards(...) while sibling handlers of the same controller are guarded
+      at method level and the controller class has no class-level @UseGuards. Unless a global APP_GUARD is
+      registered, this route is reachable without authentication/authorization.
+      Remediation: add the same @UseGuards(...) (and @Roles(...)) as the siblings, move the guard to the
+      class, or mark an intentionally public route with an explicit @Public() decorator.
+    metadata:
+      cwe: ["CWE-862: Missing Authorization"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [nestjs]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://docs.nestjs.com/guards
+        - https://cwe.mitre.org/data/definitions/862.html
+    patterns:
+      - pattern-inside: |
+          class $C {
+            ...
+            @UseGuards(...)
+            $M2(...) { ... }
+            ...
+          }
+      - pattern: |
+          @$VERB(...)
+          $M(...) { ... }
+      - metavariable-regex:
+          metavariable: $VERB
+          regex: ^(Get|Post|Put|Patch|Delete|All)$
+      - pattern-not: |
+          @UseGuards(...)
+          $M(...) { ... }
+      - pattern-not: |
+          @Public(...)
+          $M(...) { ... }
+      - pattern-not: |
+          @IsPublic(...)
+          $M(...) { ... }
+      - pattern-not: |
+          @AllowAnonymous(...)
+          $M(...) { ... }
+      - pattern-not: |
+          @SkipAuth(...)
+          $M(...) { ... }
+      - pattern-not-inside: |
+          @UseGuards(...)
+          class $K { ... }
+
+  # ------------------------------------------------------------------------------------------
+  - id: codit.ts.nestjs.idor-param-id-without-user
+    languages: [typescript]
+    severity: WARNING
+    message: >-
+      Handler $M() passes the route parameter '$ID' straight to $X.$FIND() and never uses the
+      authenticated user (@Req() req.user, a @CurrentUser()/@User() decorator, ...). Any authenticated
+      caller can read or modify someone else's record by changing the id (IDOR).
+      Remediation: pass the current user to the service and scope the lookup to the owner, or verify
+      ownership before returning/mutating.
+    metadata:
+      cwe: ["CWE-639: Authorization Bypass Through User-Controlled Key"]
+      owasp: ["A01:2021 - Broken Access Control", "A01:2025 - Broken Access Control"]
+      category: security
+      subcategory: [audit]
+      technology: [nestjs]
+      confidence: LOW
+      likelihood: MEDIUM
+      impact: HIGH
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/639.html
+    paths:
+      exclude:
+        - "*admin*"
+        - "*Admin*"
+        - "*.spec.ts"
+    patterns:
+      - pattern-inside: |
+          @$VERB(...)
+          $M(..., @Param(...) $ID, ...) { ... }
+      - metavariable-regex:
+          metavariable: $VERB
+          regex: ^(Get|Post|Put|Patch|Delete|All)$
+      - pattern-either:
+          - pattern: $X.$FIND($ID, ...)
+          - pattern: "$X.$FIND({..., $KEY: $ID, ...}, ...)"
+          - pattern: "$X.$FIND({..., where: {..., $KEY: $ID, ...}, ...}, ...)"
+      - metavariable-regex:
+          metavariable: $FIND
+          regex: ^(findById|findOne|findOneBy|findOneOrFail|findOneByOrFail|findUnique|findUniqueOrThrow|findFirst|findByPk|get|getById|getOne|update|remove|delete|destroy|softDelete|patch)$
+      - pattern-not-inside: |
+          $M(..., @Req(...) $REQ, ...) { ... }
+      - pattern-not-inside: |
+          $M(..., @Request(...) $REQ, ...) { ... }
+      - pattern-not-inside: |
+          $M(..., @CurrentUser(...) $U, ...) { ... }
+      - pattern-not-inside: |
+          $M(..., @User(...) $U, ...) { ... }
+      - pattern-not-inside: |
+          $M(..., @AuthUser(...) $U, ...) { ... }
+      - pattern-not-inside: |
+          $M(..., @GetUser(...) $U, ...) { ... }
+      - pattern-not-inside: |
+          @Roles(...)
+          $M(...) { ... }
+      - pattern-not-inside: |
+          @Roles(...)
+          class $K { ... }

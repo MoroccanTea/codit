@@ -1,0 +1,14 @@
+spring:
+  h2:
+    console:
+      enabled: false         # codit-safe: CWE-16 H2 console explicitly disabled in production
+
+server:
+  error:
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info # codit-safe: CWE-16 only health and info actuator endpoints exposed

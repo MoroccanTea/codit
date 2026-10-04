@@ -1,0 +1,11 @@
+source "https://rubygems.org"
+
+ruby "3.3.5"
+
+gem "rails", "~> 7.2.1"
+gem "pg", "~> 1.5"
+gem "puma", ">= 6.4"
+gem "bcrypt", "~> 3.1.20"
+gem "rotp", "~> 6.3"
+gem "rqrcode", "~> 2.2"
+gem "twilio-ruby", "~> 7.3"

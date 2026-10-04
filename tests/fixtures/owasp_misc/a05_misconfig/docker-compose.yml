@@ -1,0 +1,27 @@
+services:
+  web:
+    build: ./flaskapp
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://shop@db:5432/shop
+      # codit-expect: CWE-489 Flask/Werkzeug debugger enabled in the deployed compose file
+      - FLASK_DEBUG=1
+
+
+
+  worker:
+    build: ./flaskapp
+    command: celery -A tasks worker
+    # codit-expect: CWE-16 container runs privileged (full host device access)
+    privileged: true
+
+
+
+  db:
+    image: postgres:16.4
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

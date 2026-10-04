@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.acme.shop.mapper.OrderMapper">
+
+    <resultMap id="orderMap" type="com.acme.shop.domain.Order">
+        <id property="id" column="id"/>
+        <result property="customerId" column="customer_id"/>
+        <result property="status" column="status"/>
+        <result property="total" column="total"/>
+    </resultMap>
+
+    <select id="findByCustomer" resultMap="orderMap">
+        SELECT id, customer_id, status, total
+        FROM orders
+        WHERE customer_id = #{customerId}
+          AND deleted = 0
+        <!-- codit-expect: CWE-89 ${sortColumn} is spliced into the SQL text (user-controlled sort column) -->
+        ORDER BY ${sortColumn}
+    </select>
+
+
+
+    <select id="searchByKeyword" resultMap="orderMap">
+        SELECT id, customer_id, status, total
+        FROM orders
+        <!-- codit-expect: CWE-89 ${keyword} concatenated inside a LIKE literal -->
+        WHERE note LIKE '%${keyword}%'
+    </select>
+
+
+
+    <select id="searchByKeywordSafe" resultMap="orderMap">
+        SELECT id, customer_id, status, total
+        FROM orders
+        <!-- codit-safe: CWE-89 LIKE pattern built with CONCAT around a bound #{keyword} -->
+        WHERE note LIKE CONCAT('%', #{keyword}, '%')
+    </select>
+
+
+
+    <select id="findPage" resultMap="orderMap">
+        SELECT id, customer_id, status, total
+        FROM orders
+        WHERE customer_id = #{customerId}
+        <choose>
+            <when test="sort == 'total'">ORDER BY total DESC</when>
+            <otherwise>ORDER BY id DESC</otherwise>
+        </choose>
+        <!-- codit-safe: CWE-89 paging values bound with #{...} placeholders -->
+        LIMIT #{pageSize} OFFSET #{offset}
+    </select>
+</mapper>

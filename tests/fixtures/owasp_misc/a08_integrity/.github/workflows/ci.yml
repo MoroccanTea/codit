@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      # codit-expect: CWE-829 action pinned to a moving branch (master)
+      - uses: actions/checkout@master
+
+
+
+      # codit-safe: CWE-829 action pinned to a full commit SHA
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 20
+
+
+
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      # codit-expect: CWE-829 third-party deploy action tracked on its main branch with deploy secrets
+      - uses: some-vendor/k8s-deploy-action@main
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG }}

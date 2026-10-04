@@ -1,0 +1,21 @@
+name: pr-preview
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # codit-expect: CWE-829 pull_request_target checks out and builds untrusted PR code with a write token and secrets
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm ci && npm run build
+      - run: ./scripts/publish-preview.sh
+        env:
+          PREVIEW_TOKEN: ${{ secrets.PREVIEW_TOKEN }}

@@ -1,0 +1,4 @@
+# Uploaded attachments (served as-is)
+# codit-expect: CWE-548 directory listing enabled for the uploads folder
+Options +Indexes +FollowSymLinks
+AddType application/octet-stream .pdf .docx

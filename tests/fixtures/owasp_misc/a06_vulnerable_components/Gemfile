@@ -1,0 +1,15 @@
+# codit-expect: CWE-829 gems downloaded over plain http
+source "http://rubygems.org"
+
+ruby "3.3.5"
+
+
+
+# codit-safe: CWE-1104 current Rails release line
+gem "rails", "~> 7.2.1"
+
+
+
+# codit-expect: CWE-1104 nokogiri 1.10.4 bundles a vulnerable libxml2 (CVE-2019-5477 and later)
+gem "nokogiri", "1.10.4"
+gem "puma", "~> 6.4"

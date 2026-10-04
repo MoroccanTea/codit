@@ -1,0 +1,25 @@
+# codit-expect: CWE-829 package index served over plain http
+--index-url http://pypi.acme.internal/simple
+
+
+
+# codit-expect: CWE-1104 Django 2.2.0 is end-of-life with many known CVEs (SQLi, DoS)
+Django==2.2.0
+celery==5.4.0
+
+
+
+# codit-expect: CWE-1104 PyYAML 5.3 full_load arbitrary code execution (CVE-2020-1747)
+PyYAML==5.3
+gunicorn==23.0.0
+
+
+
+# codit-expect: CWE-1104 unpinned dependency, whatever version is current gets installed
+Pillow
+psycopg[binary]==3.2.3
+
+
+
+# codit-safe: CWE-1104 exact, current, non-vulnerable version
+requests==2.32.3

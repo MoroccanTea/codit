@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: vault-api
+
+security:
+  jwt:
+    # codit-expect: CWE-321 JWT signing secret committed in the config file
+    secret: "s3cr3t-signing-key-do-not-share"
+    expiration-minutes: 15
+
+
+
+  partner-jwt:
+    # codit-safe: CWE-321 secret injected from the environment at deploy time
+    secret: ${PARTNER_JWT_SECRET}
+    expiration-minutes: 15

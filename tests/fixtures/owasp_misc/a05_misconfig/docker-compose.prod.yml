@@ -1,0 +1,20 @@
+services:
+  web:
+    image: registry.acme.example/shop-web:4.2.1
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://shop@db:5432/shop
+      # codit-safe: CWE-489 debugger off
+      - FLASK_DEBUG=0
+
+
+
+  worker:
+    image: registry.acme.example/shop-web:4.2.1
+    command: celery -A tasks worker
+    # codit-safe: CWE-16 unprivileged, read-only root filesystem, all capabilities dropped
+    privileged: false
+    read_only: true
+    cap_drop:
+      - ALL

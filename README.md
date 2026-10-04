@@ -20,10 +20,11 @@ What is removed before counting:
 - Scans source code for common security vulnerabilities
 - Provides detailed reports with recommendations for fixing issues
 - Supports multiple programming languages
+- Maps every finding to OWASP Top 10 **2021 and 2025** and reports per-category coverage
 
 ## Engines 
 each one is used when installed, skipped otherwise; see `--list-tools`
-  semgrep / opengrep      multi-language (registry packs, or a local semgrep-rules clone)
+  semgrep / opengrep      multi-language (registry packs, a local semgrep-rules clone, + codit's bundled rules)
   bandit                  Python
   gosec                   Go
   brakeman                Ruby on Rails
@@ -36,8 +37,29 @@ each one is used when installed, skipped otherwise; see `--list-tools`
   devskim                 multi-language (Microsoft)
   codeql                  deep data-flow analysis (optional: --codeql)
   gitleaks, trufflehog    secrets
-  builtin                 ~125 regex rules shipped in this script (always available)
+  osv-scanner, trivy      vulnerable dependencies (all ecosystems)
+  pip-audit, npm audit    vulnerable Python / npm dependencies
+  builtin                 always available, no dependency:
+                            * ~180 regex rules (codit.py) on source and configuration files
+                            * structural analyzers (codit_analyzers.py):
+                                access control  route / handler guard analysis for Spring, JAX-RS, Express,
+                                                NestJS, Flask, Django / DRF, FastAPI, Laravel, Symfony, plain
+                                                PHP, WordPress, ASP.NET Core, Rails and Go routers: endpoints
+                                                missing the guard their siblings have, write endpoints guarded
+                                                by read permissions, IDOR, permitAll / AllowAny / disabled
+                                                method security, client-controlled roles
+                                auth / MFA      session issued before the second factor, fail-open / static /
+                                                debug OTP bypasses, OTP exposure, 2FA disable without
+                                                re-authentication, pending-2FA tokens accepted, OTP brute force
+                                                and expiry, password reset flows, session fixation
+                                taint-lite      request data -> variables -> SQL / command / path / SSRF /
+                                                redirect / eval / template / deserialization / XSS sinks
+                                dependencies    offline table of well-known vulnerable versions
   --import-sarif          merge results from any other tool (SonarQube, Checkmarx, ...)
+
+Configuration files are scanned too (not counted as auditable lines; `--no-config-scan` to skip):
+application.yml / .properties, .env, web.config / appsettings.json, nginx / Apache / Tomcat, Dockerfile,
+docker-compose, GitHub / GitLab CI, MyBatis mappers, AndroidManifest, package manifests and lock files.
 
 ## Requirements
 - Python 3.6 or higher
@@ -77,7 +99,11 @@ To install Codit, follow these steps:
    download the CodeQL bundle from github.com/github/codeql-action/releases
    brew install gitleaks | github.com/gitleaks/gitleaks/releases
    brew install trufflehog | github.com/trufflesecurity/trufflehog/releases
+   go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest | github.com/google/osv-scanner/releases
+   brew install trivy | github.com/aquasecurity/trivy/releases
+   pip install pip-audit
    ```
+   codit.py itself only needs the Python standard library.
 
 
 ## Usage
@@ -93,15 +119,38 @@ python3 codit.py /path/to/source --exclude-tests --out report_dir
 python3 codit.py /path/to/source --tools semgrep,bandit,builtin --min-severity MEDIUM
 python3 codit.py /path/to/source --semgrep-config ~/semgrep-rules     (offline)
 python3 codit.py /path/to/source --codeql --jobs 3
+python3 codit.py /path/to/source --semgrep-offline    (registry never contacted: local clone + bundled rules)
+python3 codit.py /path/to/source --no-config-scan --no-bundled-rules
 python3 codit.py --list-tools
 python3 codit.py --install         (pip-install the missing Python-based tools)
 
-# Requires codit_estimate.py in the same folder.
+# Requires codit_estimate.py and codit_analyzers.py in the same folder (rules/semgrep for the bundled rules).
 ```
 
 ## Output
 Outputs (in `--out`, default `./sast_<name>_<timestamp>/`)
-  report.html   interactive report (filters, code snippets, explanation, fix)
-  findings.json full machine-readable results
+  report.html   interactive report (filters, code snippets, explanation, fix, OWASP 2021 / 2025 coverage)
+  findings.json full machine-readable results (meta.owasp holds the per-category coverage)
   findings.csv  spreadsheet-friendly list
   findings.sarif SARIF 2.1.0 (DefectDojo, GitHub code scanning, VS Code SARIF viewer)
+  logs/         per-engine diagnostics (e.g. logs/semgrep.log: every attempt, command, exit code, errors)
+
+## Semgrep troubleshooting
+The Engines table always says which rule sources semgrep used, how many files it scanned and how many errors
+it reported (`rules: registry + codit rules | 574 files | 0 errors | semgrep 1.172.0`). Codit:
+  * finds semgrep / bandit in the Python Scripts folders even when they are not on PATH (pip --user installs),
+    and falls back to `python -m semgrep`;
+  * does not let a failed connectivity probe (proxy, TLS interception) cancel the run: the registry is still
+    tried, then a local semgrep-rules clone, then codit's bundled rules, so semgrep keeps running offline;
+  * drops a registry pack that fails to download and retries with the others;
+  * reports "scanned 0 files" as a failure instead of a silent ok;
+  * writes the full story to logs/semgrep.log in the report folder.
+
+## Tests
+Labeled fixture corpora live in tests/fixtures/ (`codit-expect: CWE-n` / `codit-safe: CWE-n` markers in
+comments). Each subdirectory is scanned as a separate project and recall / false positives are reported:
+```
+python tests/run_fixtures.py                                   all corpora, builtin engine
+python tests/run_fixtures.py a01_access_control --tools builtin,semgrep --codit-arg=--semgrep-offline
+```
+Bundled semgrep rules: `semgrep --validate --config rules/semgrep`; rule tests live in rules/semgrep-tests.

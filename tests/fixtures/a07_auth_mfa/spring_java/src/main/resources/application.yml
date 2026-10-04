@@ -1,0 +1,45 @@
+spring:
+  application:
+    name: acme-auth
+  datasource:
+    url: jdbc:postgresql://db:5432/auth
+    username: auth
+    password: ${DB_PASSWORD}
+
+server:
+  port: 8080
+  servlet:
+    session:
+      timeout: 30m
+
+app:
+  security:
+    jwt:
+      secret: ${JWT_SECRET_BASE64}
+      issuer: https://auth.acme.example
+      access-token-ttl: 15m
+
+    remember-me:
+      key: ${REMEMBER_ME_KEY}
+      # codit-expect: CWE-613 remember-me cookie valid for a whole year
+      token-validity-seconds: 31536000
+
+    login:
+      # codit-safe: CWE-307 password step locks the account after 5 failures
+      max-failed-attempts: 5
+      lockout-duration: 15m
+
+    mfa:
+      issuer-name: Acme
+      otp-length: 6
+      otp-ttl: 5m
+      totp-window-size: 3
+      # codit-expect: CWE-307 50 wrong second-factor codes allowed before any lockout
+      max-2fa-attempts: 50
+      sms-resend-interval: 60s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

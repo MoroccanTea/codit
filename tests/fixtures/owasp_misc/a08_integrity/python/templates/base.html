@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Acme{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+
+  <!-- codit-expect: CWE-829 third-party CDN script without an integrity (SRI) attribute -->
+  <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+
+
+
+  <!-- codit-safe: CWE-829 CDN script pinned with SRI and crossorigin -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.7/purify.min.js" integrity="sha512-WJ0Gk8iDe2Wm3Ilvkn9XjfVhNcvvZg5pXwiIKpHvVaxLOiXrPCzKA7lq3fZ4KeHi9X3qD5X3Wq5S1kNYoWm0QA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+
+
+  <!-- codit-safe: CWE-829 first-party script served from the application's own origin -->
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</head>
+<body>
+  {% block content %}{% endblock %}
+</body>
+</html>
