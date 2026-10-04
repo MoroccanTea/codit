@@ -358,8 +358,10 @@ def parse_members(src):
                 and not prev.endswith(('->', '=>')) and not re.search(r'[\w$>\]]\s*$', before[-2:] or ''):
             if prev.endswith(('.', '=', '(', ',', '!', '&&', '||', '?', '+')):
                 continue
-        if prev in ('new', 'return', 'throw', 'await', 'yield', 'else', 'case', 'typeof', 'delete', 'void',
+        if prev in ('new', 'return', 'throw', 'await', 'yield', 'else', 'case', 'typeof', 'delete',
                     'in', 'of', 'echo', 'print', 'go', 'defer'):
+            continue
+        if prev == 'void' and src.lang == 'js':          # JS "void expr" operator; in Java / C# it is a return type
             continue
         if prev.endswith('.') or prev.endswith('::') or prev.endswith('->'):
             continue
@@ -2582,8 +2584,85 @@ def stored_code_compare(body):
     return None
 
 
+MFA_CLAIM_NAME = re.compile(r'(?i)^[\w-]*(?:mfa|2fa|two_?factor|otp|totp)[\w-]*$')
+CLAIM_WRITE = re.compile(r'''\.(?:claim|withClaim|addClaims?|setClaim|put)\s*\(\s*["']([\w-]+)["']\s*,''')
+CLAIM_KEY = re.compile(r'''(?:^|[{,\s(])["']?([A-Za-z_][\w-]*)["']?\s*(?::|=>|=(?!=))''')
+TOKEN_READ = re.compile(r'(?i)parseClaims\w*|parseSigned\w*|getPayload\s*\(|getBody\s*\(|jwt\.(?:verify|decode)|jwtVerify|'
+                        r'JWT::decode|decode_?(?:token|jwt)|verify_?(?:token|jwt)|get_jwt\b|getClaims?\s*\(|ValidateToken|'
+                        r'HasClaim|FindFirst\w*\s*\(|jwt_required|get_jwt_identity|\.Claims\b')
+CLAIM_READ_LINE = re.compile(r'(?i)claims?|payload|decoded|getClaim|get_jwt|req\.(?:user|auth)|request\.(?:user|auth)|'
+                             r'token|jwt|HasClaim|FindFirst|principal|identity')
+
+
+def mfa_claim_writes(src, funcs):
+    """[(claim, line, func)] for MFA-state claims put into tokens by this file."""
+    res = []
+    for f in funcs:
+        body, fm = f.body(), f.masked()
+        builds = bool(TOKEN_ISSUE.search(body))
+        if builds:
+            for m in CLAIM_WRITE.finditer(body):
+                if MFA_CLAIM_NAME.match(m.group(1)):
+                    res.append((m.group(1), src.line_of(f.start + m.start()), f))
+        for m in TOKEN_ISSUE.finditer(body):
+            po = fm.find('(', m.end() - 1)
+            if po < 0:
+                continue
+            call = body[po:match_close(fm, po) + 1]
+            for k in CLAIM_KEY.finditer(call):
+                if MFA_CLAIM_NAME.match(k.group(1)):
+                    res.append((k.group(1), src.line_of(f.start + po + k.start(1)), f))
+    return res
+
+
+def mfa_unread_claims(funcs_by_src, out):
+    """Report MFA-state claims that are written into tokens but never checked when tokens are read.
+
+    The classic response-manipulation 2FA bypass: the login answers {"require2FA": true, "token": ...}; the token
+    only *says* 2FA is pending and nothing on the verification side enforces it, so flipping the flag in the response
+    (or just ignoring it) and replaying the token gives a full session."""
+    writes = [(src, w) for src, funcs in funcs_by_src for w in mfa_claim_writes(src, funcs)]
+    if not writes or not any(TOKEN_READ.search(s.code) for s, _ in funcs_by_src):
+        return set()
+    writer_funcs = {id(w[2]) for _, w in writes}
+    unread, reported = set(), set()
+    for src, (claim, line, _) in writes:
+        if claim in reported:
+            continue
+        rx = re.compile(r'(?<![\w-])%s(?![\w-])' % re.escape(claim))
+        read = False
+        for s2, funcs2 in funcs_by_src:
+            if not rx.search(s2.code):
+                continue
+            for f in funcs2:
+                if id(f) in writer_funcs:
+                    continue
+                body = f.body()
+                for ln in body.split('\n'):
+                    if rx.search(ln) and (CLAIM_READ_LINE.search(ln) or TOKEN_READ.search(body)):
+                        read = True
+                        break
+                if read:
+                    break
+            if read:
+                break
+        reported.add(claim)
+        if read:
+            continue
+        unread.add(claim)
+        out.append(finding(src.rel, line, 'mfa-claim-not-enforced', 'Token carries a 2FA-pending flag nothing enforces',
+                           'The token is minted with the "%s" claim, but no filter / middleware / guard that reads tokens '
+                           'ever checks it: a token issued while the second factor is still pending is accepted as a full '
+                           'session. Changing "%s" to false in the login response (response manipulation) or simply '
+                           'replaying the token skips 2FA. Reject tokens carrying this claim on every route except the '
+                           'OTP verification endpoint, or issue a separate role-less pending ticket.' % (claim, claim),
+                           'HIGH', 'MEDIUM', 308))
+    return unread
+
+
 def analyze_authflow(srcs, out):
     funcs_by_src = [(s, functions(s)) for s in srcs]
+    unread_claims = mfa_unread_claims(funcs_by_src, out)
     proj_mfa = any(OTP_VERIFY.search(s.code) or re.search(r'(?i)totp|two_?factor|2fa|mfa|otp', s.code) for s in srcs)
     proj_pending = any(re.search(r'(?i)(?:pending|pre_?2fa|pre_?auth|partial)\w*\s*["\']?\s*[:=\]]|2FA_PENDING|mfa_?pending|'
                                  r'scope\s*[:=]\s*["\']mfa', s.code) for s in srcs)
@@ -2617,8 +2696,9 @@ def analyze_authflow(srcs, out):
             ctx_text = (f.decor or '') + ' ' + src.above(f.line, 4)
             # ---- (a) full session / token issued in the same function that answers "MFA required"
             sig = MFA_SIGNAL.search(body)
-            token_factory = bool(SCOPED.search(f.name or '') or re.search(r'(?i)^(?:generate|create|issue|build|sign|make|new|'
-                                                                          r'encode|mint)\w*(?:token|jwt|ticket)', f.name or ''))
+            # a "handlePending2FA" helper is judged by the token it mints, not by its name
+            token_factory = bool(re.search(r'(?i)^(?:generate|create|issue|build|sign|make|new|encode|mint)\w*(?:token|jwt|ticket)',
+                                           f.name or ''))
             if sig and not token_factory and not OTP_VERIFY.search(body[:sig.start()]):
                 hit = None
                 for m in sorted(list(SESSION_ISSUE.finditer(body)) + list(COOKIE_ISSUE.finditer(body)), key=lambda x: x.start()):
@@ -2634,13 +2714,17 @@ def analyze_authflow(srcs, out):
                         line_txt = body[ls:le if le > 0 else len(body)]
                         po = fm.find('(', m.end() - 1)
                         call = body[m.start():(match_close(fm, po) + 1) if po >= 0 else m.end()]
-                        if SCOPED.search(line_txt) or SCOPED.search(call):
+                        # the call and the rest of its line decide the scope; "pendingToken = generateToken(..roles..)"
+                        # is still a full token whatever the variable is called
+                        if SCOPED.search(body[m.start():le if le > 0 else len(body)]) or SCOPED.search(call):
                             continue
                         var = re.search(r'(\w+)\s*(?::\s*[\w<>]+\s*)?=\s*[^=\n]*$', body[ls:m.start()])
                         stmt_s = max(body.rfind(';', 0, sig.start()), body.rfind('\n\n', 0, sig.start()),
                                      body.rfind('return', 0, sig.start()) - 1)
-                        stmt = body[stmt_s:body.find(';', sig.end()) if body.find(';', sig.end()) > 0 else sig.end() + 200]
-                        if (stmt_s < m.start() < sig.start() + 200) or (var and re.search(r'\b%s\b' % re.escape(var.group(1)), stmt)):
+                        stmt_e = body.find(';', sig.end()) if body.find(';', sig.end()) > 0 else sig.end() + 200
+                        stmt = body[stmt_s:stmt_e]
+                        if (stmt_s < m.start() < min(sig.start() + 200, stmt_e)) or \
+                                (var and m.start() < sig.start() and re.search(r'\b%s\b' % re.escape(var.group(1)), stmt)):
                             hit = m
                             break
                 if hit is not None:
@@ -2751,7 +2835,7 @@ def analyze_authflow(srcs, out):
                                    'in this file: a 6-digit code can be brute-forced.' % (f.name or 'Verification'),
                                    'MEDIUM', 'LOW', 307))
             # ---- (g) auth guard that accepts pending-2FA sessions
-            if proj_mfa and proj_pending and AUTH_GUARD_NAME.match(f.name or '') and \
+            if proj_mfa and proj_pending and AUTH_GUARD_NAME.match(f.name or '') and f.name != f.cls and \
                     re.search(r'(?i)verify|decode|parse|session|jwt|token|user_id|userId', body) and \
                     not PENDING_MARK.search(body) and not (f.cls and PENDING_MARK.search(src.code)) and \
                     not re.search(r'(?i)whitelist|permitAll|authWhitelist', body) and \
@@ -2762,7 +2846,8 @@ def analyze_authflow(srcs, out):
                                    'Authentication guard accepts pending-2FA sessions',
                                    '%s authenticates any valid session / token without checking that the second factor was '
                                    'completed, while the application issues pending-MFA sessions / tokens: the OTP step can '
-                                   'be skipped by calling protected routes directly.' % f.name, 'HIGH', 'LOW', 308))
+                                   'be skipped by calling protected routes directly.' % f.name, 'HIGH',
+                                   'MEDIUM' if unread_claims else 'LOW', 308))
             # ---- (i) MFA / role decisions on variables bound from client-controlled data
             reported = set()
             for var, key, kind in client_bound_vars(f):

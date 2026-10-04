@@ -50,8 +50,9 @@ each one is used when installed, skipped otherwise; see `--list-tools`
                                                 method security, client-controlled roles
                                 auth / MFA      session issued before the second factor, fail-open / static /
                                                 debug OTP bypasses, OTP exposure, 2FA disable without
-                                                re-authentication, pending-2FA tokens accepted, OTP brute force
-                                                and expiry, password reset flows, session fixation
+                                                re-authentication, pending-2FA tokens accepted, 2FA-pending
+                                                token claims never enforced (response-manipulation bypass),
+                                                OTP brute force and expiry, password reset flows, session fixation
                                 taint-lite      request data -> variables -> SQL / command / path / SSRF /
                                                 redirect / eval / template / deserialization / XSS sinks
                                 dependencies    offline table of well-known vulnerable versions
