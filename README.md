@@ -26,7 +26,15 @@ What is removed before counting:
   vulnerable installed version, and npm packages only installed through devDependencies flagged and lowered one level
 
 ## Engines 
-each one is used when installed, skipped otherwise; see `--list-tools`
+each one is used when installed, skipped otherwise; see `--list-tools`. Engines installed after the terminal was
+opened are still found: the persisted user / system PATH and the usual install folders (dotnet tools, go/bin, cargo,
+WinGet, scoop, Homebrew, composer) are searched too.
+
+Noise control applied after merging: hard-coded credential hits in test code become INFO (known token formats such as
+AWS / GitHub keys and private keys excepted), notoriously noisy rules (find-sec-bugs HARD_CODE_KEY-2/3/4,
+CUSTOM_INJECTION-2) are kept only when another engine reports the same spot, and DevSkim's setTimeout-with-a-function,
+non-security TODO, http:// namespace and localhost hits are dropped or shown as INFO. trivy falls back to
+`--offline-scan` when Maven Central cannot be reached or rate-limits the scan.
   semgrep / opengrep      multi-language (registry packs, a local semgrep-rules clone, + codit's bundled rules);
                           framework / JWT / Docker / nginx / CI packs are added for what the project uses
   bandit                  Python
@@ -78,7 +86,7 @@ docker-compose, GitHub / GitLab CI, MyBatis mappers, AndroidManifest, package ma
 To install Codit, follow these steps:
 1. Clone the repository:
    ```
-   git clone 
+   git clone https://github.com/MoroccanTea/codit
    ```
 2. Navigate to the project directory:
    ```
@@ -105,7 +113,7 @@ To install Codit, follow these steps:
    download the CodeQL bundle from github.com/github/codeql-action/releases
    brew install gitleaks | github.com/gitleaks/gitleaks/releases
    brew install trufflehog | github.com/trufflesecurity/trufflehog/releases
-   go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest | github.com/google/osv-scanner/releases
+   go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest | github.com/google/osv-scanner/releases | winget install Google.OSVScanner
    brew install trivy | github.com/aquasecurity/trivy/releases
    pip install pip-audit
    ```

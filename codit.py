@@ -969,7 +969,8 @@ PLACEHOLDER_VAL = re.compile(
     r'hidden|enter|insert|type|\*\*\*)', re.I)
 SECRET_KEY_NOISE = re.compile(r'(field|label|placeholder|name|param|column|header|url|path|input|'
                               r'type|policy|regex|pattern|message|msg|error|hint|reset|forgot|confirm|'
-                              r'length|min|max|rule|valid|strength|prompt|title|text|key_?id|_id$|file)', re.I)
+                              r'length|min|max|rule|validat|strength|prompt|title|text|key_?id|_id$|file)', re.I)
+# not 'valid': VALID_PASSWORD / validPassword are the classic names of a static credential checked at login
 
 
 def _valid_secret(m):
@@ -1853,6 +1854,49 @@ def python_script_dirs():
 
 
 PY_MODULE_FALLBACK = {'semgrep': 'semgrep', 'bandit': 'bandit'}
+_TOOL_DIRS = None
+
+
+def tool_search_dirs():
+    """Folders searched when an engine is not on this process' PATH: a terminal opened before the engine was
+    installed keeps a stale PATH (Windows only refreshes it for new sessions), and per-user installers
+    (dotnet tool, go install, cargo, winget, scoop, composer, pipx) often add their folder to PATH only later."""
+    global _TOOL_DIRS
+    if _TOOL_DIRS is not None:
+        return _TOOL_DIRS
+    home = os.path.expanduser('~')
+    cands = []
+    if os.name == 'nt':
+        try:
+            import winreg
+            for hive, key in ((winreg.HKEY_CURRENT_USER, r'Environment'),
+                              (winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\Session Manager\Environment')):
+                try:
+                    with winreg.OpenKey(hive, key) as k:
+                        cands += os.path.expandvars(winreg.QueryValueEx(k, 'Path')[0]).split(';')
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        local = os.environ.get('LOCALAPPDATA') or os.path.join(home, 'AppData', 'Local')
+        cands += [os.path.join(local, 'Microsoft', 'WinGet', 'Links'), os.path.join(home, 'scoop', 'shims'),
+                  os.path.join(os.environ.get('APPDATA') or '', 'Composer', 'vendor', 'bin'),
+                  os.path.join(os.environ.get('APPDATA') or '', 'npm')]
+    else:
+        cands += ['/opt/homebrew/bin', '/usr/local/bin', '/snap/bin', os.path.join(home, '.local', 'bin'),
+                  os.path.join(home, '.composer', 'vendor', 'bin'), os.path.join(home, '.config', 'composer', 'vendor', 'bin')]
+    gopath = os.environ.get('GOPATH') or os.path.join(home, 'go')
+    cands += [os.path.join(home, '.dotnet', 'tools'), os.path.join(gopath, 'bin'), os.path.join(home, '.cargo', 'bin')]
+    current = {os.path.normcase(os.path.normpath(p)) for p in os.environ.get('PATH', '').split(os.pathsep) if p}
+    out, seen = [], set()
+    for d in cands:
+        d = (d or '').strip().strip('"')
+        k = os.path.normcase(os.path.normpath(d)) if d else ''
+        if d and k not in seen and k not in current and os.path.isdir(d):
+            seen.add(k)
+            out.append(d)
+    _TOOL_DIRS = out
+    return out
 
 
 def which_any(names):
@@ -1860,7 +1904,7 @@ def which_any(names):
         p = shutil.which(n)
         if p:
             return p
-    for d in python_script_dirs():
+    for d in tool_search_dirs() + python_script_dirs():
         for n in names:
             p = shutil.which(n, path=d)
             if p:
@@ -2487,6 +2531,49 @@ def parse_sarif(data, tool, base):
     return res
 
 
+def _raw_source_line(r, cache):
+    """Source line of a raw finding (SARIF uris may be relative, absolute or file:// URLs)."""
+    p = r.get('path') or ''
+    if p.startswith('file:'):
+        from urllib.parse import unquote, urlparse
+        p = unquote(urlparse(p).path)
+        if re.match(r'^/[A-Za-z]:', p):
+            p = p[1:]
+    if not os.path.isabs(p):
+        p = os.path.join(r.get('base') or '', p)
+    if p not in cache:
+        try:
+            with open(p, encoding='utf-8', errors='replace') as f:
+                cache[p] = f.read().split('\n')
+        except OSError:
+            cache[p] = []
+    lines, i = cache[p], (r.get('line') or 0) - 1
+    return (lines[i] if 0 <= i < len(lines) else ''), p
+
+
+# DevSkim rules that are mostly noise on modern code, with the condition under which a hit is kept
+DEVSKIM_TIMER = re.compile(r'\bset(?:Timeout|Interval|Immediate)\s*\(\s*(?:["\'`]|[\w.$]+\s*\+)')   # string argument = eval
+DEVSKIM_TODO_KEEP = re.compile(r'(?i)auth|login|logout|passw|token|session|secur|crypt|cipher|secret|credential|csrf|xss|'
+                               r'sqli?\b|inject|sanitiz|escap|bypass|hack|insecure|vuln|permission|privilege|role|admin|'
+                               r'verif|tls|ssl|cert')
+DEVSKIM_HTTP_DROP = re.compile(r'(?i)xmlns|w3\.org|/schemas?/|sitemaps\.org|(?:startsWith|indexOf|includes|match|test|replace)'
+                               r'\s*\(\s*["\']https?://["\']|[=!]==?\s*["\']https?://["\']|^\s*(?://|#|\*)')
+
+
+def devskim_keep(r, cache):
+    rule = r['rule']
+    if rule not in ('DS172411', 'DS176209', 'DS137138'):
+        return True
+    line, path = _raw_source_line(r, cache)
+    if not line:
+        return True
+    if rule == 'DS172411':              # setTimeout / setInterval: only a string argument is evaluated as code
+        return bool(DEVSKIM_TIMER.search(line))
+    if rule == 'DS176209':              # TODO / FIXME: only when it is about security or sits in security code
+        return bool(DEVSKIM_TODO_KEEP.search(line) or DEVSKIM_TODO_KEEP.search(os.path.basename(path)))
+    return not DEVSKIM_HTTP_DROP.search(line)    # DS137138 http:// URL: not namespaces, comments or scheme checks
+
+
 def run_devskim(ctx, exe):
     out_f = os.path.join(ctx.work, 'devskim.sarif')
     rc, out, err = run_cmd([exe, 'analyze', '-I', ctx.stage, '-O', out_f, '-f', 'sarif'],
@@ -2495,7 +2582,10 @@ def run_devskim(ctx, exe):
         raise ToolError(last_line(err) or last_line(out) or 'no SARIF output')
     with open(out_f, encoding='utf-8', errors='replace') as f:
         data = load_json(f.read())
-    return parse_sarif(data, 'devskim', ctx.stage), None
+    res, cache = parse_sarif(data, 'devskim', ctx.stage), {}
+    kept = [r for r in res if devskim_keep(r, cache)]
+    return kept, ('%d low-value hits dropped (setTimeout with a function, non-security TODOs, http:// namespaces / '
+                  'scheme checks)' % (len(res) - len(kept))) if len(kept) < len(res) else None
 
 
 CODEQL_LANGS = [  # (codeql language, extensions, build mode)
@@ -2647,8 +2737,19 @@ def run_osv(ctx, exe):
 
 
 def run_trivy(ctx, exe):
-    rc, out, err = run_cmd([exe, 'fs', '--scanners', 'vuln', '--format', 'json', '--quiet', ctx.stage], timeout=ctx.timeout)
+    cmd = [exe, 'fs', '--scanners', 'vuln', '--format', 'json', '--quiet']
+    rc, out, err = run_cmd(cmd + [ctx.stage], timeout=ctx.timeout)
     data = load_json(out)
+    note = None
+    if not isinstance(data, dict) and re.search(r'(?i)maven|remote .*repository|429|Too Many Requests|pom', err or ''):
+        # trivy aborts the whole scan (npm / pip included) when it cannot download Maven parent POMs: rate limiting
+        # by Maven Central, no network, or internal artifacts. Offline mode only uses the declared versions.
+        tool_log(ctx, 'trivy', 'online scan failed, retrying with --offline-scan\n%s' % '\n'.join((err or '').strip().splitlines()[-6:]))
+        why = 'Maven Central rate limit (HTTP 429)' if re.search(r'\b429\b|Too Many Requests', err or '') else 'repository unreachable'
+        rc, out, err = run_cmd(cmd + ['--offline-scan', ctx.stage], timeout=ctx.timeout)
+        data = load_json(out)
+        note = ('offline scan: Maven parent / BOM versions could not be downloaded (%s), so versions inherited from '
+                'them are not checked (osv-scanner still covers pom.xml)' % why)
     if not isinstance(data, dict):
         raise ToolError(last_line(err) or 'no JSON output (the vulnerability DB may need a first online run)')
     res = []
@@ -2667,7 +2768,7 @@ def run_trivy(ctx, exe):
                                                     (' - fixed in %s' % ', '.join(fixed[:3])) if fixed else ''),
                                    sev, 'HIGH', [c for v in vs for c in (v.get('CweIDs') or [])] or 1104,
                                    refs=[v.get('PrimaryURL') for v in vs[:3]], base=ctx.stage))
-    return res, None
+    return res, note
 
 
 def run_pip_audit(ctx, exe):
@@ -3062,6 +3163,41 @@ def _dep_title(group):
     return ('Vulnerable dependency %s %s' % (name, ver)).strip()
 
 
+CRED_CWES = {798, 259, 321, 547}
+# credential formats that are real even inside a test (cloud / VCS / payment tokens, private keys)
+REAL_TOKEN_RULES = re.compile(r'^(builtin:secret-token|builtin:secret-connection-string|trufflehog:)')
+# rules whose hits are almost always false positives unless another engine reports the same spot
+SOLO_NOISE_RULES = re.compile(r'find_sec_bugs\.(?:HARD_CODE_KEY-[234]|CUSTOM_INJECTION-2)$')
+INFO_RULES = {'devskim:DS162092'}          # "localhost used": informational
+
+
+def is_test_path(rel):
+    parts = rel.replace('\\', '/').split('/')
+    return bool(AS.TEST_FILE.search(parts[-1])) or any(p in AS.TEST_DIRS for p in parts[:-1])
+
+
+def apply_noise_policy(merged):
+    """Re-rank findings using what only the merged view knows (which engines agree, where the code lives)."""
+    out = []
+    for m in merged:
+        rules = m['rules']
+        if m['tools'] == ['semgrep'] and all(SOLO_NOISE_RULES.search(r) for r in rules):
+            continue
+        note = None
+        if m.get('kind') != 'dependency' and (kb_key(m['cwe']) in CRED_CWES or m['cwe'] in CRED_CWES) and \
+                is_test_path(m['file']) and not any(REAL_TOKEN_RULES.match(r) for r in rules):
+            note = 'test code: a fixture value, not a production credential (shown as INFO)'
+        elif set(rules) <= INFO_RULES:
+            note = 'informational: localhost / loopback reference'
+        elif set(rules) <= {'devskim:DS137138'} and is_test_path(m['file']):
+            note = 'test code: http:// URL in a test'
+        if note:
+            m['severity'], m['confidence'] = 'INFO', 'LOW'
+            m['description'] = m['description'] + ['[codit] ' + note]
+        out.append(m)
+    return out
+
+
 def merge_findings(raws, root, scope, args):
     normalize_dependency_raws(raws)
     buckets = {}
@@ -3139,6 +3275,7 @@ def merge_findings(raws, root, scope, args):
             references=refs, secret=secret,
             snippet=make_snippet(root, rel, line, max(g['end_line'] for g in group), args.context, secret)))
 
+    merged = apply_noise_policy(merged)
     min_rank = SEV_RANK[args.min_severity]
     merged = [m for m in merged if SEV_RANK[m['severity']] >= min_rank]
     merged.sort(key=lambda m: (-SEV_RANK[m['severity']], -CONF_RANK[m['confidence']], m['file'], m['line']))
@@ -3324,7 +3461,8 @@ pre{background:var(--code);border:1px solid var(--line);border-radius:6px;paddin
 font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 pre div{padding:0 10px;white-space:pre}pre div.hl{background:var(--hl)}pre .ln{display:inline-block;width:4.5em;color:var(--muted);user-select:none}
 a{color:var(--accent);overflow-wrap:anywhere;word-break:break-word}.muted{color:var(--muted)}
-#sevboxes{display:flex;flex-wrap:wrap;gap:6px 10px}
+#sevboxes,#confboxes{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
+.cpill{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
 .body p,.t{overflow-wrap:anywhere}
 .count{color:var(--muted);font-size:13px;margin-left:auto}
 .st-ok{color:#2e7d32}.st-failed,.st-timeout{color:var(--high)}.st-missing,.st-skipped{color:var(--muted)}
@@ -3348,6 +3486,7 @@ a{color:var(--accent);overflow-wrap:anywhere;word-break:break-word}.muted{color:
 <h2>Findings</h2>
 <div class="filters" id="filters">
 <span id="sevboxes"></span>
+<span id="confboxes"><span class="muted">Confidence</span></span>
 <select id="fkind"></select>
 <select id="ftool"><option value="">All tools</option></select>
 <select id="fcat"><option value="">All categories</option></select>
@@ -3391,14 +3530,17 @@ var cats={};D.findings.forEach(function(f){var k=f.category;cats[k]=cats[k]||{n:
 var ctb=document.querySelector('#cats tbody');Object.keys(cats).sort(function(a,b){return cats[b].n-cats[a].n}).forEach(function(k){
   var tr=el('tr');tr.appendChild(el('td',null,k));tr.appendChild(el('td','muted',cats[k].o||''));tr.appendChild(el('td','muted hide-sm',cats[k].o5||''));tr.appendChild(el('td','num',String(cats[k].n)));ctb.appendChild(tr);});
 var boxes=document.getElementById('sevboxes');var active={};
-SEV.forEach(function(s){active[s]=true;var l=el('label');var cb=el('input');cb.type='checkbox';cb.checked=true;
+SEV.forEach(function(s){active[s]=(s!=='INFO');var l=el('label');var cb=el('input');cb.type='checkbox';cb.checked=active[s];
   cb.addEventListener('change',function(){active[s]=cb.checked;render();});l.appendChild(cb);var p=el('span','pill '+s,s);l.appendChild(p);boxes.appendChild(l);});
+var cboxes=document.getElementById('confboxes');var cactive={};
+['HIGH','MEDIUM','LOW'].forEach(function(s){cactive[s]=true;var l=el('label');var cb=el('input');cb.type='checkbox';cb.checked=true;
+  cb.addEventListener('change',function(){cactive[s]=cb.checked;render();});l.appendChild(cb);l.appendChild(el('span','cpill',s));cboxes.appendChild(l);});
 var tools={};D.findings.forEach(function(f){f.tools.forEach(function(t){tools[t]=1})});
 var ft=document.getElementById('ftool');Object.keys(tools).sort().forEach(function(t){var o=el('option',null,t);o.value=t;ft.appendChild(o);});
 var fc=document.getElementById('fcat');Object.keys(cats).sort().forEach(function(t){var o=el('option',null,t);o.value=t;fc.appendChild(o);});
 var fk=document.getElementById('fkind');[['','Code + dependencies ('+D.findings.length+')'],['code','Code & configuration ('+ncode+')'],
   ['dependency','Vulnerable dependencies ('+ndep+')']].forEach(function(k){var o=el('option',null,k[1]);o.value=k[0];fk.appendChild(o);});
-fk.value=(ndep&&ncode)?'code':'';
+fk.value='';
 var fq=document.getElementById('fq');[fk,ft,fc].forEach(function(x){x.addEventListener('change',render)});fq.addEventListener('input',render);
 function card(f){var d=el('details','f '+f.severity);var s=el('summary');
   s.appendChild(el('span','pill '+f.severity,f.severity));
@@ -3417,7 +3559,7 @@ function card(f){var d=el('details','f '+f.severity);var s=el('summary');
   d.appendChild(b);return d;}
 var list=document.getElementById('list');var LIMIT=400;
 function render(){var q=fq.value.toLowerCase();var t=ft.value,cat=fc.value,k=fk.value;
-  var res=D.findings.filter(function(f){if(!active[f.severity])return false;if(k&&(f.kind||'code')!==k)return false;if(t&&f.tools.indexOf(t)<0)return false;if(cat&&f.category!==cat)return false;
+  var res=D.findings.filter(function(f){if(!active[f.severity])return false;if(cactive[f.confidence]===false)return false;if(k&&(f.kind||'code')!==k)return false;if(t&&f.tools.indexOf(t)<0)return false;if(cat&&f.category!==cat)return false;
     if(q){var blob=(f.file+' '+f.title+' '+f.category+' '+f.rules.join(' ')+' '+f.description.join(' ')+' '+f.id+' CWE-'+f.cwe).toLowerCase();if(blob.indexOf(q)<0)return false;}return true;});
   list.textContent='';res.slice(0,LIMIT).forEach(function(f){list.appendChild(card(f))});
   document.getElementById('count').textContent=res.length+' shown'+(res.length>LIMIT?' (first '+LIMIT+' rendered - refine filters)':'');}
