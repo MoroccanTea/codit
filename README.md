@@ -21,10 +21,14 @@ What is removed before counting:
 - Provides detailed reports with recommendations for fixing issues
 - Supports multiple programming languages
 - Maps every finding to OWASP Top 10 **2021 and 2025** and reports per-category coverage
+- Reports vulnerable dependencies separately from code findings: one entry per package (all engines merged, the
+  advisory CWE kept as detail so library CVEs do not inflate code categories such as XSS or SSRF), the exact
+  vulnerable installed version, and npm packages only installed through devDependencies flagged and lowered one level
 
 ## Engines 
 each one is used when installed, skipped otherwise; see `--list-tools`
-  semgrep / opengrep      multi-language (registry packs, a local semgrep-rules clone, + codit's bundled rules)
+  semgrep / opengrep      multi-language (registry packs, a local semgrep-rules clone, + codit's bundled rules);
+                          framework / JWT / Docker / nginx / CI packs are added for what the project uses
   bandit                  Python
   gosec                   Go
   brakeman                Ruby on Rails
@@ -43,8 +47,9 @@ each one is used when installed, skipped otherwise; see `--list-tools`
                             * ~180 regex rules (codit.py) on source and configuration files
                             * structural analyzers (codit_analyzers.py):
                                 access control  route / handler guard analysis for Spring, JAX-RS, Express,
-                                                NestJS, Flask, Django / DRF, FastAPI, Laravel, Symfony, plain
-                                                PHP, WordPress, ASP.NET Core, Rails and Go routers: endpoints
+                                                NestJS, Flask (incl. RESTX / RESTful / MethodView class views),
+                                                Django / DRF, FastAPI, Laravel, Symfony, plain PHP, WordPress,
+                                                ASP.NET Core, Rails and Go routers: endpoints
                                                 missing the guard their siblings have, write endpoints guarded
                                                 by read permissions, IDOR, permitAll / AllowAny / disabled
                                                 method security, client-controlled roles
@@ -122,6 +127,8 @@ python3 codit.py /path/to/source --semgrep-config ~/semgrep-rules     (offline)
 python3 codit.py /path/to/source --codeql --jobs 3
 python3 codit.py /path/to/source --semgrep-offline    (registry never contacted: local clone + bundled rules)
 python3 codit.py /path/to/source --no-config-scan --no-bundled-rules
+python3 codit.py /path/to/source --no-framework-packs    (language packs only, no flask / django / expressjs /
+                                                       findsecbugs / jwt / dockerfile / nginx / CI packs)
 python3 codit.py --list-tools
 python3 codit.py --install         (pip-install the missing Python-based tools)
 

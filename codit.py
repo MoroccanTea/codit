@@ -1949,6 +1949,64 @@ SEMGREP_LANG = [  # (extensions, registry pack, folder in semgrep-rules repo)
 ]
 
 
+# framework / platform packs, selected from code and configuration signals (every pack verified to exist
+# in the registry; p/express, p/angular, p/spring, p/laravel and p/rails do not)
+SEMGREP_CODE_SIGNALS = [  # (extensions searched, regex, pack)
+    (('.py',), r'^\s*(?:from|import)\s+flask(?:_\w+)?\b', 'p/flask'),
+    (('.py',), r'^\s*(?:from|import)\s+(?:django|rest_framework)\b', 'p/django'),
+    (('.py',), r'^\s*(?:from|import)\s+fastapi\b', 'p/fastapi'),
+    (('.js', '.mjs', '.cjs', '.ts', '.mts', '.cts'), r'require\(\s*["\']express["\']\s*\)|from\s+["\']express["\']',
+     'p/expressjs'),
+    (('.py', '.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.java', '.kt', '.go', '.rb', '.php', '.cs'),
+     r'(?i)^\s*import\s+jwt\b|^\s*from\s+jwt\b|jsonwebtoken|io\.jsonwebtoken|com\.auth0\.jwt|nimbus-jose|golang-jwt|'
+     r'firebase/php-jwt|\bJWT::(?:encode|decode)|JwtSecurityTokenHandler|flask_jwt_extended|from\s+jose\b', 'p/jwt'),
+]
+
+
+def _head(ctx, rec, size=65536):
+    try:
+        with open(os.path.join(ctx.stage, rec['path']), encoding='utf-8', errors='replace') as f:
+            return f.read(size)
+    except OSError:
+        return ''
+
+
+def semgrep_extra_packs(ctx):
+    """Framework, JWT and infrastructure packs for what the project actually uses."""
+    packs = set()
+    if ctx.has('.java', '.jsp', '.jspx'):
+        packs.add('p/findsecbugs')
+    pending = [(set(exts), re.compile(rx, re.M), pack) for exts, rx, pack in SEMGREP_CODE_SIGNALS]
+    for r in ctx.records:
+        if not pending:
+            break
+        todo = [p for p in pending if r['ext'] in p[0]]
+        if not todo:
+            continue
+        txt = _head(ctx, r)
+        for p in todo:
+            if p[1].search(txt):
+                packs.add(p[2])
+                pending.remove(p)
+    for r in ctx.configs:
+        kind, low = r.get('config'), r['path'].replace('\\', '/').lower()
+        if kind == 'dockerfile':
+            packs.add('p/dockerfile')
+        elif kind == 'compose':
+            packs.add('p/docker-compose')
+        elif kind == 'ci' and '.github/workflows/' in low:
+            packs.add('p/github-actions')
+        elif kind == 'server' and 'p/nginx' not in packs:
+            if re.search(r'^\s*(?:server|location|upstream|http)\b[^{;\n]*\{', _head(ctx, r), re.M):
+                packs.add('p/nginx')
+        elif kind == 'yaml' and 'p/kubernetes' not in packs:
+            head = _head(ctx, r, 16384)
+            if re.search(r'^apiVersion\s*:', head, re.M) and \
+                    re.search(r'^kind\s*:\s*(?:Deployment|Pod|StatefulSet|DaemonSet|Job|CronJob|Service|Ingress)\b', head, re.M):
+                packs.add('p/kubernetes')
+    return sorted(packs)
+
+
 def find_semgrep_rules_dir(args):
     cands = [getattr(args, 'semgrep_rules_dir', None), os.environ.get('SEMGREP_RULES_DIR'),
              os.path.join(os.path.dirname(os.path.abspath(__file__)), 'semgrep-rules'),
@@ -2090,18 +2148,20 @@ def run_semgrep(ctx, exe):
                          expand_semgrep_configs(user_cfg, ctx)))
     else:
         langs = [pack for exts, pack, _ in SEMGREP_LANG if pack and ctx.has(*exts)]
-        packs = SEMGREP_BASE + sorted(set(langs))
+        extra = [] if ctx.args.no_framework_packs else semgrep_extra_packs(ctx)
+        packs = SEMGREP_BASE + sorted(set(langs)) + extra
+        reg_label = 'registry' + (' (+%s)' % ', '.join(p[2:] for p in extra) if extra else '')
         online = not ctx.args.semgrep_offline
         reachable = online and semgrep_registry_reachable()
         if reachable:
-            attempts.append(('registry', packs))
+            attempts.append((reg_label, packs))
         repo = find_semgrep_rules_dir(ctx.args)
         if repo:
             local = build_local_semgrep_rules(repo, ctx)
             if local:
                 attempts.append(('local ' + repo, [local]))
         if online and not reachable:
-            attempts.append(('registry (connectivity probe failed, tried anyway)', packs))
+            attempts.append((reg_label + ' (connectivity probe failed, tried anyway)', packs))
     if bundled:
         attempts = [(label + ' + codit rules', cfgs + [bundled]) for label, cfgs in attempts]
         attempts.append(('codit bundled rules only', [bundled]))
@@ -2642,13 +2702,36 @@ def run_pip_audit(ctx, exe):
             fixes = sorted({f for v in vulns for f in (v.get('fix_versions') or [])})
             res.append(raw_finding('pip-audit', rel, _manifest_line(ctx.stage, rel, d.get('name', '')), 'pip-audit:%s' % d.get('name'),
                                    'Vulnerable dependency %s %s' % (d.get('name'), d.get('version')),
-                                   '%s %s: %s%s' % (d.get('name'), d.get('version'), ', '.join(v.get('id', '') for v in vulns[:5]),
+                                   '%s %s: %s%s' % (d.get('name'), d.get('version'), ', '.join(list(dict.fromkeys(v.get('id', '') for v in vulns))[:5]),
                                                     (' - fixed in %s' % ', '.join(fixes[:3])) if fixes else ''),
                                    'HIGH', 'HIGH', 1104, refs=['https://osv.dev/vulnerability/%s' % v.get('id') for v in vulns[:3]],
                                    base=ctx.stage))
     if notes and not res and len(notes) == len(reqs):
         raise ToolError(notes[0])
     return res, '; '.join(notes)[:200] or None
+
+
+def _npm_lock_packages(path):
+    """({package name: [(installed version, dev-only flag), ...]}, {install path: (version, dev-only flag)}) from a
+    package-lock / shrinkwrap (v1, v2 and v3); install paths are the 'nodes' npm audit reports as vulnerable."""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lock = json.load(f)
+    except (OSError, ValueError):
+        return {}, {}
+    by_name, by_path = defaultdict(list), {}
+    for key, p in (lock.get('packages') or {}).items():
+        if key and isinstance(p, dict) and 'node_modules/' in key and not p.get('link'):
+            by_path[key] = (p.get('version'), bool(p.get('dev')))
+            by_name[p.get('name') or key.rsplit('node_modules/', 1)[1]].append(by_path[key])
+    if not by_name:
+        def walk(deps):
+            for name, p in (deps or {}).items():
+                if isinstance(p, dict):
+                    by_name[name].append((p.get('version'), bool(p.get('dev'))))
+                    walk(p.get('dependencies'))
+        walk(lock.get('dependencies'))
+    return by_name, by_path
 
 
 def run_npm_audit(ctx, exe):
@@ -2664,16 +2747,24 @@ def run_npm_audit(ctx, exe):
             notes.append('%s: %s' % (rel, (data or {}).get('error', {}).get('summary') if isinstance(data, dict) else last_line(err)))
             continue
         manifest = os.path.join(os.path.dirname(rel), 'package.json')
+        by_name, by_path = _npm_lock_packages(os.path.join(ctx.stage, rel))
         for name, v in (data.get('vulnerabilities') or {}).items():
             via = [x for x in v.get('via') or [] if isinstance(x, dict)]
             if not via:
                 continue                                  # only transitively affected through another package
             where = manifest if v.get('isDirect') and os.path.isfile(os.path.join(ctx.stage, manifest)) else rel
-            res.append(raw_finding('npm-audit', where, _manifest_line(ctx.stage, where, name), 'npm-audit:%s' % name,
-                                   'Vulnerable dependency %s %s' % (name, v.get('range', '')),
-                                   '%s (%s): %s' % (name, v.get('range', ''), '; '.join((x.get('title') or '')[:90] for x in via[:3])),
-                                   v.get('severity'), 'HIGH', [c for x in via for c in (x.get('cwe') or [])] or 1104,
-                                   refs=[x.get('url') for x in via[:3]], base=ctx.stage))
+            copies = [by_path[n] for n in v.get('nodes') or [] if n in by_path] or by_name.get(name) or []
+            vers = sorted({ver for ver, _ in copies if ver})
+            shown = ', '.join(vers[:3]) if vers else v.get('range', '')
+            r = raw_finding('npm-audit', where, _manifest_line(ctx.stage, where, name), 'npm-audit:%s' % name,
+                            'Vulnerable dependency %s %s' % (name, shown),
+                            '%s %s (affected: %s): %s' % (name, shown, v.get('range', ''),
+                                                          '; '.join((x.get('title') or '')[:90] for x in via[:3])),
+                            v.get('severity'), 'HIGH', [c for x in via for c in (x.get('cwe') or [])] or 1104,
+                            refs=[x.get('url') for x in via[:3]], base=ctx.stage)
+            if copies:
+                r['dev_only'] = all(dev for _, dev in copies)
+            res.append(r)
     if notes and not res and len(notes) == len(locks):
         raise ToolError(str(notes[0]))
     return res, '; '.join(map(str, notes))[:200] or None
@@ -2921,13 +3012,64 @@ def make_snippet(root, rel, line, end_line, context, secret):
     return out
 
 
+DEP_TOOLS = {'npm-audit', 'pip-audit', 'osv-scanner', 'trivy'}
+DEP_RULES = {'deps-known-vulnerable'}
+DEP_NAME_CWES = {1104, 937, 1035, 1395, 1357}
+SEV_DOWN = {'CRITICAL': 'HIGH', 'HIGH': 'MEDIUM', 'MEDIUM': 'LOW', 'LOW': 'LOW', 'INFO': 'INFO'}
+
+
+def _dep_name(f):
+    if f['tool'] in DEP_TOOLS and ':' in f['rule']:
+        return f['rule'].split(':', 1)[1]
+    m = re.search(r'dependency:?\s+(\S+)', f['title'] or '', re.I)
+    return m.group(1) if m else None
+
+
+def normalize_dependency_raws(raws):
+    """One vulnerable package = one finding, whatever the number of engines and files reporting it.
+
+    Every engine's report of the same package in the same project folder is moved to one location (the
+    manifest line rather than the lock file) and tagged with the package name, so merge_findings folds them.
+    The advisory CWE (e.g. CWE-79 for an XSS fixed in a library) is kept in the message only: the finding is a
+    vulnerable component, not an injection in the project's own code, and must not inflate code categories."""
+    groups = defaultdict(list)
+    for f in raws:
+        if f['tool'] not in DEP_TOOLS and f['rule'] not in DEP_RULES:
+            continue
+        name = _dep_name(f)
+        if name:
+            groups[(os.path.dirname(f['rel']), re.sub(r'[-_.]+', '-', name.lower()))].append(f)
+    for (_, name), fs in groups.items():
+        lead = min(fs, key=lambda f: (os.path.basename(f['rel']).lower() in LOCK_FILES, f['line'] <= 0, f['line']))
+        for f in fs:
+            adv = [x for x in f['cwes'] if x not in DEP_NAME_CWES]
+            if adv and f['message']:
+                f['message'] += ' (advisory %s)' % ', '.join('CWE-%d' % x for x in adv[:4])
+            f['rel'], f['line'], f['end_line'] = lead['rel'], lead['line'], lead['line']
+            f['dep'] = name
+
+
+def _dep_title(group):
+    """'Vulnerable dependency <name> <version>', preferring an exact installed version over an advisory range."""
+    name, versions = group[0]['dep'], []
+    for g in group:
+        m = re.search(r'dependency:?\s+(\S+)\s+(.+)$', g['title'] or '', re.I)
+        if m:
+            name = m.group(1)
+            versions.append(m.group(2).strip())
+    exact = [v for v in versions if re.match(r'^v?\d[\w.+-]*$', v)]
+    ver = (exact or versions or [''])[0]
+    return ('Vulnerable dependency %s %s' % (name, ver)).strip()
+
+
 def merge_findings(raws, root, scope, args):
+    normalize_dependency_raws(raws)
     buckets = {}
     for f in raws:
-        cwe = choose_cwe(f)
+        cwe = 1104 if f.get('dep') else choose_cwe(f)
         key_cwe = kb_key(cwe) or cwe
         f['cwe'] = cwe
-        family = key_cwe if key_cwe else 'rule:' + f['tool'] + ':' + f['rule']
+        family = 'dep:' + f['dep'] if f.get('dep') else (key_cwe if key_cwe else 'rule:' + f['tool'] + ':' + f['rule'])
         key = (f['rel'], f['line'], family)
         buckets.setdefault(key, []).append(f)
     # the same weakness reported by different engines 1-2 lines apart (e.g. the start vs the end of a call chain)
@@ -2976,8 +3118,19 @@ def merge_findings(raws, root, scope, args):
         else:
             category = kbv['name'] if kb else (lead['title'] or 'Security weakness')
         owasp = next((g['owasp'] for g in group if g.get('owasp')), None) or kbv['owasp']
+        dep = next((g['dep'] for g in group if g.get('dep')), None)
+        if dep:
+            title = _dep_title(group)
+            dev_flags = [g['dev_only'] for g in group if 'dev_only' in g]
+            if dev_flags and all(dev_flags):
+                sev = SEV_DOWN[sev]
+                title += ' (dev / build-time only)'
+                messages.append('[codit] only installed through devDependencies (build / test tooling, not part of the '
+                                'production runtime): severity lowered one level. Still upgrade it: build tools run on '
+                                'developer machines and CI with access to source and secrets.')
         merged.append(dict(
-            id='', severity=sev, confidence=conf, category=category, title=title,
+            id='', kind='dependency' if dep else 'code', package=dep or '',
+            severity=sev, confidence=conf, category=category, title=title,
             cwe=cwe, owasp=owasp, owasp2025=owasp_2025(owasp, cwe), file=rel.replace(os.sep, '/'), line=line,
             end_line=max(g['end_line'] for g in group),
             tools=tools, rules=sorted({'%s:%s' % (g['tool'], g['rule']) for g in group}),
@@ -3195,6 +3348,7 @@ a{color:var(--accent);overflow-wrap:anywhere;word-break:break-word}.muted{color:
 <h2>Findings</h2>
 <div class="filters" id="filters">
 <span id="sevboxes"></span>
+<select id="fkind"></select>
 <select id="ftool"><option value="">All tools</option></select>
 <select id="fcat"><option value="">All categories</option></select>
 <input type="search" id="fq" placeholder="Search file, rule, text...">
@@ -3217,6 +3371,8 @@ document.getElementById('subtitle').textContent=D.meta.root+'  \u00b7  '+D.meta.
 var cards=document.getElementById('cards');
 SEV.forEach(function(s){var c=el('div','card sev '+s);c.appendChild(el('div','n',String(D.meta.counts[s]||0)));c.appendChild(el('div','l',s));cards.appendChild(c);});
 var c2=el('div','card');c2.appendChild(el('div','n',String(D.findings.length)));c2.appendChild(el('div','l','Total findings'));cards.appendChild(c2);
+var ndep=D.findings.filter(function(f){return f.kind==='dependency'}).length,ncode=D.findings.length-ndep;
+if(ndep){var c4=el('div','card');c4.appendChild(el('div','n',String(ndep)));c4.appendChild(el('div','l','Vulnerable packages'));cards.appendChild(c4);}
 var c3=el('div','card');c3.appendChild(el('div','n',String(D.meta.tools.filter(function(t){return t.status==='ok'}).length)));c3.appendChild(el('div','l','Engines run'));cards.appendChild(c3);
 function bar(counts){var b=el('div','bar');var tot=0;SEV.forEach(function(s){tot+=counts[s]||0});
   SEV.forEach(function(s){var n=counts[s]||0;if(!n)return;var sp=el('span',s);sp.style.width=(100*n/tot)+'%';sp.style.background='var(--sev)';sp.title=s+': '+n;b.appendChild(sp);});return b;}
@@ -3240,7 +3396,10 @@ SEV.forEach(function(s){active[s]=true;var l=el('label');var cb=el('input');cb.t
 var tools={};D.findings.forEach(function(f){f.tools.forEach(function(t){tools[t]=1})});
 var ft=document.getElementById('ftool');Object.keys(tools).sort().forEach(function(t){var o=el('option',null,t);o.value=t;ft.appendChild(o);});
 var fc=document.getElementById('fcat');Object.keys(cats).sort().forEach(function(t){var o=el('option',null,t);o.value=t;fc.appendChild(o);});
-var fq=document.getElementById('fq');[ft,fc].forEach(function(x){x.addEventListener('change',render)});fq.addEventListener('input',render);
+var fk=document.getElementById('fkind');[['','Code + dependencies ('+D.findings.length+')'],['code','Code & configuration ('+ncode+')'],
+  ['dependency','Vulnerable dependencies ('+ndep+')']].forEach(function(k){var o=el('option',null,k[1]);o.value=k[0];fk.appendChild(o);});
+fk.value=(ndep&&ncode)?'code':'';
+var fq=document.getElementById('fq');[fk,ft,fc].forEach(function(x){x.addEventListener('change',render)});fq.addEventListener('input',render);
 function card(f){var d=el('details','f '+f.severity);var s=el('summary');
   s.appendChild(el('span','pill '+f.severity,f.severity));
   var mid=el('div');mid.appendChild(el('div','t',f.title));mid.appendChild(el('div','loc',f.file+':'+f.line));s.appendChild(mid);
@@ -3257,8 +3416,8 @@ function card(f){var d=el('details','f '+f.severity);var s=el('summary');
   b.appendChild(el('p','muted','Rules: '+f.rules.join(', ')));
   d.appendChild(b);return d;}
 var list=document.getElementById('list');var LIMIT=400;
-function render(){var q=fq.value.toLowerCase();var t=ft.value,cat=fc.value;
-  var res=D.findings.filter(function(f){if(!active[f.severity])return false;if(t&&f.tools.indexOf(t)<0)return false;if(cat&&f.category!==cat)return false;
+function render(){var q=fq.value.toLowerCase();var t=ft.value,cat=fc.value,k=fk.value;
+  var res=D.findings.filter(function(f){if(!active[f.severity])return false;if(k&&(f.kind||'code')!==k)return false;if(t&&f.tools.indexOf(t)<0)return false;if(cat&&f.category!==cat)return false;
     if(q){var blob=(f.file+' '+f.title+' '+f.category+' '+f.rules.join(' ')+' '+f.description.join(' ')+' '+f.id+' CWE-'+f.cwe).toLowerCase();if(blob.indexOf(q)<0)return false;}return true;});
   list.textContent='';res.slice(0,LIMIT).forEach(function(f){list.appendChild(card(f))});
   document.getElementById('count').textContent=res.length+' shown'+(res.length>LIMIT?' (first '+LIMIT+' rendered - refine filters)':'');}
@@ -3338,11 +3497,24 @@ def print_summary(meta, findings, hot_files, hot_dirs, args):
             parts = ' '.join(c('%s:%d' % (s[0], r['counts'][s]), *SEV_STYLE[s]) for s in SEVERITIES if r['counts'][s])
             print('   %s %s  %s' % (c('%5d pts' % r['score'], C.BOLD), c('%-60s' % r['name'][-60:], C.CYAN), parts))
 
-    show = [f for f in findings if SEV_RANK[f['severity']] >= SEV_RANK[args.console_min]][:args.console_limit]
+    deps = [f for f in findings if f.get('kind') == 'dependency']
+    code = [f for f in findings if f.get('kind') != 'dependency']
+    if deps:
+        print('\n ' + c('Vulnerable dependencies', C.BOLD, C.MAGENTA) +
+              c('  (%d packages - one line each, details in report.html)' % len(deps), C.GREY))
+        for f in deps[:args.console_limit]:
+            print('   %s %s %s %s' % (sev_label(f['severity'], 9), c('%-58s' % f['title'][len('Vulnerable dependency '):][:58], C.BOLD),
+                                      c('%-34s' % ('%s:%d' % (f['file'], f['line']))[-34:], C.CYAN),
+                                      c(', '.join(f['tools']), C.GREY)))
+        if len(deps) > args.console_limit:
+            print('   %s' % c('... %d more in report.html' % (len(deps) - args.console_limit), C.GREY))
+
+    show = [f for f in code if SEV_RANK[f['severity']] >= SEV_RANK[args.console_min]][:args.console_limit]
     if show:
         print('\n' + rule)
-        print(' ' + c('TOP FINDINGS', C.BOLD, C.BCYAN) + c('  (%s and above, %d of %d shown - full detail in report.html)'
-                                                          % (args.console_min, len(show), total), C.GREY))
+        print(' ' + c('TOP FINDINGS', C.BOLD, C.BCYAN) + c('  (code & configuration, %s and above, %d of %d shown - '
+                                                          'full detail in report.html)'
+                                                          % (args.console_min, len(show), len(code)), C.GREY))
         print(rule)
         wrap = textwrap.TextWrapper(width=w, initial_indent=' ' * 12, subsequent_indent=' ' * 12)
         for f in show:
@@ -3472,6 +3644,9 @@ def main():
                         'is filtered automatically to the detected languages')
     g.add_argument('--semgrep-rules-dir', help='local semgrep-rules clone used when the registry is unreachable')
     g.add_argument('--semgrep-offline', action='store_true', help='never contact the semgrep registry')
+    g.add_argument('--no-framework-packs', action='store_true',
+                   help='only language packs: skip the framework / JWT / Docker / nginx / CI registry packs '
+                        'selected from what the project uses')
     g.add_argument('--no-bundled-rules', action='store_true',
                    help="do not add codit's own semgrep rules (rules/semgrep) to the semgrep run")
     g.add_argument('--verify-secrets', action='store_true',
@@ -3665,7 +3840,8 @@ def main():
         r.pop('_status', None)
 
     findings = merge_findings(kept, root, scope, args)
-    hot_files, hot_dirs = hotspots(findings, records)
+    # hotspots rank the project's own code: lock files / manifests listing vulnerable packages would dominate them
+    hot_files, hot_dirs = hotspots([f for f in findings if f.get('kind') != 'dependency'], records)
     counts = {s: 0 for s in SEVERITIES}
     for f in findings:
         counts[f['severity']] += 1
@@ -3676,7 +3852,9 @@ def main():
                                             review_days=round(scope_lines / float(args.rate or 1), 1)),
                 tools=statuses, counts=counts, owasp=owasp_coverage(findings, statuses),
                 config_files=len(configs), raw_results=len(raws), out_of_scope_dropped=dropped,
-                min_severity=args.min_severity, duration_s=round(time.time() - t0, 1))
+                min_severity=args.min_severity, duration_s=round(time.time() - t0, 1),
+                code_findings=sum(1 for f in findings if f.get('kind') != 'dependency'),
+                vulnerable_dependencies=sum(1 for f in findings if f.get('kind') == 'dependency'))
 
     # ------------------------------------------------------------------ outputs
     write_json(os.path.join(out_dir, 'findings.json'), meta, findings, hot_files, hot_dirs)

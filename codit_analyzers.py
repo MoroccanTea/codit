@@ -650,6 +650,7 @@ AUTH_PATH = re.compile(
     r'otp|mfa|2fa|two-factor|totp|oauth2?|sso|saml|csrf|csrf-cookie|health[\w-]*|ready|readiness|liveness|ping|'
     r'captcha|webhooks?|robots\.txt|sitemap|favicon\.ico|swagger[\w-]*|api-docs|openapi[\w-]*|tokens?)(?:[/.{?]|$)')
 AUTH_PATH_WEAK = re.compile(r'(?i)(?:^|/)(?:reset[\w-]*|verify[\w-]*|verification|confirm[\w-]*|activate[\w-]*|refresh[\w-]*|'
+                            r'(?:re)?send[-_]?(?:activation|verification|confirmation)[\w-]*|activation[\w-]*|'
                             r'callback[\w-]*|status|version|public[\w-]*|error|docs|static|assets|live)(?:[/.{?]|$)')
 AUTH_CONTEXT = re.compile(r'(?i)(auth|password|passwd|account|email|session|login|oauth|2fa|mfa|otp|user/?$|'
                           r'identity|jwt|sso)')
@@ -659,7 +660,8 @@ AUTH_NAME = re.compile(r'(?i)^(?:log_?in\w*|log_?out|sign_?in|sign_?out|sign_?up
                        r'forgot\w*|(?:reset|change|update|recover)_?password\w*|password_?reset\w*|otp\w*|mfa\w*|'
                        r'two_?factor\w*|login2fa|refresh_?token|oauth\w*|sso\w*|saml\w*|csrf\w*|health\w*|ping|'
                        r'captcha\w*|webhook\w*|index|home|landing|about|contact|robots|sitemap|swagger\w*|'
-                       r'(?:verify|confirm|activate)_?(?:email|account|registration|otp|code|token|mfa|2fa|reset)\w*)$')
+                       r'(?:verify|confirm|activate)_?(?:email|account|registration|otp|code|token|mfa|2fa|reset)\w*|'
+                       r'(?:re)?send_?(?:activation|verification|confirmation)\w*)$')
 SENSITIVE_PATH = re.compile(r'(?i)(?:^|/|_|-)(?:admin\w*|manage\w*|management|role\w*|permission\w*|privilege\w*|'
                             r'users?|accounts?|members?|staff|employees?|config\w*|settings?|setup|system|audit\w*|'
                             r'actuator|internal|tenants?|organi[sz]ations?|billing|payments?|refunds?|transfers?|'
@@ -1588,7 +1590,7 @@ def analyze_nest(srcs, out):
 # =========================================================================== #
 # Python: Flask, FastAPI, Django, Django REST framework
 # =========================================================================== #
-PY_GUARD = re.compile(r'(?i)(?:^|\.)(?:login_required|jwt_required|auth\w*_required|token_required|roles?_(?:required|accepted)|'
+PY_GUARD = re.compile(r'(?i)(?:^|\.)(?:\w*login_required|\w*jwt_required|auth\w*_required|\w*token_required|roles?_(?:required|accepted)|'
                       r'permission\w*|requires?_\w+|admin\w*|staff\w*|superuser\w*|has_(?:role|permission|perm|scope)\w*|'
                       r'verify_jwt\w*|authenticated|protected|secured|scopes?_required|api_key\w*|'
                       r'check_\w*(?:auth|role|perm|admin|access)\w*|authoriz\w*|access_required|restricted|user_required|'
@@ -1637,6 +1639,37 @@ def drf_level(text):
 
 
 FLASK_DEC = re.compile(r'^([\w.]+?)\.(route|get|post|put|patch|delete)\s*\(\s*[rbuf]?["\']([^"\']*)["\'](.*)$', re.S)
+PY_HTTP_METHODS = ('get', 'post', 'put', 'patch', 'delete')
+
+
+def _py_bracket_end(text, i):
+    """Index just past the bracket opened at text[i] (string literals are not special-cased)."""
+    depth = 0
+    for k in range(i, len(text)):
+        if text[k] in '([{':
+            depth += 1
+        elif text[k] in ')]}':
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return len(text)
+
+
+def py_class_view_guard(cls_body, verb):
+    """Guard level of a class-based view method from MethodView `decorators = [...]` or
+    flask-restful / flask-restx `method_decorators = [...]` / `{verb: [...]}`."""
+    decos = []
+    for m in re.finditer(r'^[ \t]*(method_decorators|decorators)\s*=\s*([\[{(])', cls_body, re.M):
+        start = m.end() - 1
+        block = cls_body[start:_py_bracket_end(cls_body, start)]
+        if m.group(2) == '{':
+            km = re.search(r'["\']%s["\']\s*:\s*([\[(])' % verb, block, re.I)
+            if not km:
+                continue
+            block = block[km.end() - 1:_py_bracket_end(block, km.end() - 1)]
+        names = re.findall(r'[A-Za-z_][\w.]*', re.sub(r'(["\']).*?\1', '""', block))
+        decos += [(n, block, 0) for n in names if PY_GUARD.search(n)]
+    return py_deco_level(decos)
 FASTAPI_DEC = re.compile(r'^([\w.]+?)\.(get|post|put|patch|delete|api_route|head|options)\s*\(\s*[rbuf]?["\']([^"\']*)["\'](.*)$', re.S)
 DRF_BASE = re.compile(r'\b(?:APIView|GenericAPIView|ViewSet|ModelViewSet|GenericViewSet|ReadOnlyModelViewSet|\w+APIView|\w+ViewSet)\b')
 DRF_MUTATING = re.compile(r'\b(?:ModelViewSet|CreateModelMixin|UpdateModelMixin|DestroyModelMixin|CreateAPIView|UpdateAPIView|'
@@ -1738,6 +1771,27 @@ def analyze_python(srcs, out):
                 parts = m.group(1).split('.')
                 key = parts[-2] if parts[-1] == 'router' and len(parts) > 1 else parts[-1]
                 fast_guarded_mods[key] = ('authz' if PY_AUTHZ.search(' '.join(deps)) else 'authn', ', '.join(deps))
+    # class-based views registered away from the class: api.add_resource(Cls, '/p') / add_url_rule(view_func=Cls.as_view())
+    class_routes = {}
+    for s in srcs:
+        for m in re.finditer(r'(\w+)\.add_resource\s*\(\s*(\w+)\s*,\s*[rbuf]?["\']([^"\']*)["\']', s.code):
+            class_routes.setdefault(m.group(2), (m.group(1), m.group(3)))
+        for m in re.finditer(r'(\w+)\.add_url_rule\s*\(\s*[rbuf]?["\']([^"\']*)["\'][^)]*?view_func\s*=\s*(\w+)\.as_view',
+                             s.code):
+            class_routes.setdefault(m.group(3), (m.group(1), m.group(2)))
+
+    def flask_register(src, it, e, path):
+        e.body = it.body_text()
+        e.params = it.header
+        ids = re.findall(r'<(?:\w+:)?(\w+)>|\{(\w+)\}', path)
+        e.id_params = [a or b for a, b in ids]
+        flask_eps.append(e)
+        check_read_guard_on_write(e, out)
+        if e.level not in ('authz', 'deny'):
+            req_ids = re.findall(r'request\.(?:args|form|values|json)(?:\.get)?\s*[\[(]\s*["\'](\w*id)["\']', e.body)
+            _py_idor(src, it, [i for i in e.id_params if ID_NAME.match(i) or i.endswith('id')] +
+                     [r for r in req_ids], e.label(), out, e.fw)
+
     for src in srcs:
         items = py_items(src)
         text = src.code
@@ -1794,17 +1848,45 @@ def analyze_python(srcs, out):
                         lv = max_level(lv, g)
                         expr = expr or '%s.before_request guard' % var
                 e = Endpoint(src, line, verb, path, it.name, lv, expr, (src.rel, var), 'fastapi' if is_fast else 'flask')
-                e.body = it.body_text()
-                e.params = it.header
-                ids = re.findall(r'<(?:\w+:)?(\w+)>|\{(\w+)\}', path)
-                e.id_params = [a or b for a, b in ids]
-                (fast_eps if is_fast else flask_eps).append(e)
-                check_read_guard_on_write(e, out)
-                if e.level not in ('authz', 'deny'):
-                    req_ids = re.findall(r'request\.(?:args|form|values|json)(?:\.get)?\s*[\[(]\s*["\'](\w*id)["\']', e.body)
-                    _py_idor(src, it, [i for i in e.id_params if ID_NAME.match(i) or i.endswith('id')] +
-                             [r for r in req_ids], e.label(), out, e.fw)
+                if is_fast:
+                    e.body = it.body_text()
+                    e.params = it.header
+                    ids = re.findall(r'<(?:\w+:)?(\w+)>|\{(\w+)\}', path)
+                    e.id_params = [a or b for a, b in ids]
+                    fast_eps.append(e)
+                    check_read_guard_on_write(e, out)
+                    if e.level not in ('authz', 'deny'):
+                        req_ids = re.findall(r'request\.(?:args|form|values|json)(?:\.get)?\s*[\[(]\s*["\'](\w*id)["\']',
+                                             e.body)
+                        _py_idor(src, it, [i for i in e.id_params if ID_NAME.match(i) or i.endswith('id')] + req_ids,
+                                 e.label(), out, e.fw)
+                else:
+                    flask_register(src, it, e, path)
                 break
+        # ---------------- class-based views: flask-restx / flask-restful Resource, Flask MethodView
+        for cls in (items if not is_fast else ()):
+            if cls.kind != 'class':
+                continue
+            route = next(((fm.group(1), fm.group(3)) for fm in (FLASK_DEC.match(d[1]) for d in cls.decorators)
+                          if fm and fm.group(2) == 'route'), None) or class_routes.get(cls.name)
+            if route is None:
+                continue
+            var, path = route
+            cls_body = cls.body_text()
+            cls_lv, cls_expr = py_deco_level([d for d in cls.decorators if not FLASK_DEC.match(d[1])])
+            for it in items:
+                if it.parent is not cls or it.kind != 'def' or it.name.lower() not in PY_HTTP_METHODS:
+                    continue
+                lv, expr = py_deco_level(it.decorators)
+                vlv, vexpr = py_class_view_guard(cls_body, it.name.lower())
+                lv, expr = max_level(lv, cls_lv, vlv), expr or cls_expr or vexpr
+                g = bp_guard.get(var) or global_app_guard
+                if g:
+                    lv = max_level(lv, g)
+                    expr = expr or '%s.before_request guard' % var
+                e = Endpoint(src, it.line, it.name.upper(), path, '%s.%s' % (cls.name, it.name), lv, expr,
+                             (src.rel, var), 'flask')
+                flask_register(src, it, e, path)
         if not is_django or is_fast:
             continue
         # ---------------- Django / DRF
